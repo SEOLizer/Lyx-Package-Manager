@@ -23,11 +23,16 @@ clean:
 
 .PHONY: all clean
 
-test: bin/resolver_test
+test: bin/resolver_test bin/index_test
 	./bin/resolver_test
+	./bin/index_test
 
 bin/resolver_test: tests/resolver_test.lyx lpm/core/resolver.lyx lpm/core/semver.lyx lpm/core/lockfile.lyx
 	mkdir -p bin
 	$(LYXC) tests/resolver_test.lyx -I $(ROOT) -I $(AURUM) -o bin/resolver_test
+
+bin/index_test: tests/index_test.lyx lpm/core/index.lyx lpm/core/resolver.lyx lpm/core/semver.lyx lpm/core/lockfile.lyx
+	mkdir -p bin
+	$(LYXC) tests/index_test.lyx -I $(ROOT) -I $(AURUM) -o bin/index_test
 
 .PHONY: test

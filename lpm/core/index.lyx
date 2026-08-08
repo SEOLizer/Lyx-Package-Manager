@@ -1,0 +1,383 @@
+// lpm/core/index.lyx
+// WP-PM-05 (Teil 1): Parser fuer die Registry-Indizes.
+//
+// Format siehe docs/registry.md. Zwei Dokumente:
+//
+//   /packages/<name>/index.json   Versionsliste eines Pakets, inklusive
+//                                 sha256, source und dependencies. Das ist die
+//                                 Auflösungsquelle -> fuellt den DepCatalog.
+//
+//   /index.json                   Gesamtindex fuer `lpm search`: name, latest,
+//                                 description.
+//
+// Der Parser ist bewusst klein und auf genau diese beiden Formen zugeschnitten,
+// statt einen allgemeinen JSON-Baum zu bauen: die Registry ist unser eigenes
+// Format, und ein Baum wuerde fuer jede Version Allokationen erzeugen, die der
+// Katalog gleich wieder kopiert.
+//
+// Robustheit: unbekannte Schluessel werden ueberlesen (ixSkipValue kann jeden
+// JSON-Wert ueberspringen), damit ein spaeter erweiterter Index aeltere
+// lpm-Versionen nicht bricht.
+
+@description("lpm registry index parser")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.index;
+
+import std.io;
+import lpm.core.resolver;
+
+pub con IX_OK:         int64 := 0;
+pub con IX_ERR_SYNTAX: int64 := 0 - 1;   // kein gueltiges JSON in erwarteter Form
+pub con IX_ERR_NAME:   int64 := 0 - 2;   // Index gehoert zu einem anderen Paket
+pub con IX_ERR_LIMIT:  int64 := 0 - 3;   // Katalog- oder Puffergrenze erreicht
+
+con IX_STR_MAX:  int64 := 512;
+con IX_MAX_DEPS: int64 := 64;    // Dependencies je Version
+
+// ---------------------------------------------------------------------------
+// Scanner-Grundlagen
+// ---------------------------------------------------------------------------
+
+fn ixWs(buf: int64, i: int64): int64 {
+  var p: int64 := i;
+  while true {
+    var c: int64 := peek8(buf + p) as int64;
+    if c == 32 { p := p + 1; }
+    else if c == 9 { p := p + 1; }
+    else if c == 10 { p := p + 1; }
+    else if c == 13 { p := p + 1; }
+    else { break; }
+  }
+  return p;
+}
+
+// Liest einen JSON-String ab Position i (dort steht das oeffnende ").
+// Schreibt den entpackten Inhalt nach dst. Rueckgabe: Position hinter dem
+// schliessenden ", oder -1 bei Syntaxfehler.
+fn ixString(buf: int64, i: int64, dst: int64, cap: int64): int64 {
+  if peek8(buf + i) as int64 != 34 { return 0 - 1; }
+  var p: int64 := i + 1;
+  var n: int64 := 0;
+  while true {
+    var c: int64 := peek8(buf + p) as int64;
+    if c == 0 { return 0 - 1; }
+    if c == 34 { p := p + 1; break; }
+    if c == 92 {
+      // Escape: nur die in unseren Indizes moeglichen Faelle.
+      p := p + 1;
+      var e: int64 := peek8(buf + p) as int64;
+      if e == 0 { return 0 - 1; }
+      if e == 110 { c := 10; }
+      else if e == 116 { c := 9; }
+      else if e == 114 { c := 13; }
+      else if e == 117 {
+        // \uXXXX wird nicht dekodiert — als '?' abgelegt, Position weiter.
+        c := 63;
+        p := p + 4;
+      }
+      else { c := e; }
+    }
+    if n < cap - 1 {
+      poke8(dst + n, c);
+      n := n + 1;
+    }
+    p := p + 1;
+  }
+  poke8(dst + n, 0);
+  return p;
+}
+
+// Ueberspringt einen beliebigen JSON-Wert ab i. Rueckgabe: Position danach,
+// oder -1 bei Syntaxfehler.
+fn ixSkipValue(buf: int64, i: int64): int64 {
+  var p: int64 := ixWs(buf, i);
+  var c: int64 := peek8(buf + p) as int64;
+
+  if c == 34 {
+    // String — ohne Ziel, deshalb eigener Lauf
+    p := p + 1;
+    while true {
+      var s: int64 := peek8(buf + p) as int64;
+      if s == 0 { return 0 - 1; }
+      if s == 92 { p := p + 2; }
+      else if s == 34 { return p + 1; }
+      else { p := p + 1; }
+    }
+  }
+
+  if c == 123 || c == 91 {
+    // Objekt oder Array — Tiefe zaehlen, Strings dabei ueberspringen
+    var depth: int64 := 0;
+    while true {
+      var d: int64 := peek8(buf + p) as int64;
+      if d == 0 { return 0 - 1; }
+      if d == 34 {
+        p := p + 1;
+        while true {
+          var s2: int64 := peek8(buf + p) as int64;
+          if s2 == 0 { return 0 - 1; }
+          if s2 == 92 { p := p + 2; }
+          else if s2 == 34 { p := p + 1; break; }
+          else { p := p + 1; }
+        }
+      } else {
+        if d == 123 { depth := depth + 1; }
+        if d == 91  { depth := depth + 1; }
+        if d == 125 { depth := depth - 1; }
+        if d == 93  { depth := depth - 1; }
+        p := p + 1;
+        if depth == 0 { return p; }
+      }
+    }
+  }
+
+  // Zahl, true, false, null — bis zum naechsten Trenner
+  while true {
+    var t: int64 := peek8(buf + p) as int64;
+    if t == 0 { break; }
+    if t == 44 { break; }
+    if t == 125 { break; }
+    if t == 93 { break; }
+    if t == 32 { break; }
+    if t == 10 { break; }
+    if t == 13 { break; }
+    if t == 9 { break; }
+    p := p + 1;
+  }
+  return p;
+}
+
+// Erwartet ein bestimmtes Zeichen an Position i (nach Whitespace).
+// Rueckgabe: Position danach, oder -1.
+fn ixExpect(buf: int64, i: int64, ch: int64): int64 {
+  var p: int64 := ixWs(buf, i);
+  if peek8(buf + p) as int64 != ch { return 0 - 1; }
+  return p + 1;
+}
+
+// ---------------------------------------------------------------------------
+// /packages/<name>/index.json  ->  DepCatalog
+// ---------------------------------------------------------------------------
+
+// Anzahl der zuletzt von ixVersions aufgenommenen Versionen (-1 = Katalog voll).
+// ixVersions liefert die Scanner-Position zurueck, deshalb steht die Anzahl hier.
+var ixLastCount: int64 := 0;
+
+// Liest das dependencies-Objekt einer Version. Namen und Constraints landen in
+// den uebergebenen Puffern; Rueckgabe: Position danach oder -1.
+fn ixDeps(buf: int64, i: int64, names: int64, cons: int64, countOut: int64): int64 {
+  var p: int64 := ixExpect(buf, i, 123);
+  if p < 0 { return 0 - 1; }
+  var n: int64 := 0;
+
+  p := ixWs(buf, p);
+  if peek8(buf + p) as int64 == 125 {
+    poke64(countOut, 0);
+    return p + 1;
+  }
+
+  while true {
+    p := ixWs(buf, p);
+    var nameBuf: int64 := alloc(IX_STR_MAX);
+    p := ixString(buf, p, nameBuf, IX_STR_MAX);
+    if p < 0 { free(nameBuf, IX_STR_MAX); return 0 - 1; }
+    p := ixExpect(buf, p, 58);
+    if p < 0 { free(nameBuf, IX_STR_MAX); return 0 - 1; }
+    p := ixWs(buf, p);
+    var consBuf: int64 := alloc(IX_STR_MAX);
+    p := ixString(buf, p, consBuf, IX_STR_MAX);
+    if p < 0 {
+      free(nameBuf, IX_STR_MAX);
+      free(consBuf, IX_STR_MAX);
+      return 0 - 1;
+    }
+
+    if n < IX_MAX_DEPS {
+      poke64(names + n * 8, nameBuf);
+      poke64(cons  + n * 8, consBuf);
+      n := n + 1;
+    } else {
+      free(nameBuf, IX_STR_MAX);
+      free(consBuf, IX_STR_MAX);
+    }
+
+    p := ixWs(buf, p);
+    var c: int64 := peek8(buf + p) as int64;
+    if c == 44 { p := p + 1; }
+    else if c == 125 { p := p + 1; break; }
+    else { return 0 - 1; }
+  }
+
+  poke64(countOut, n);
+  return p;
+}
+
+// Parst den Paket-Index in den Katalog. name ist das Paket, das angefordert
+// wurde — stimmt der Index nicht damit ueberein, wird abgebrochen (eine
+// Registry darf nicht unbemerkt ein anderes Paket liefern).
+// Rueckgabe: Anzahl aufgenommener Versionen, oder IX_ERR_*.
+pub fn IxParsePackageIndex(json: pchar, name: pchar, cat: DepCatalog): int64 {
+  var buf: int64 := json as int64;
+  var p: int64 := ixExpect(buf, 0, 123);
+  if p < 0 { return IX_ERR_SYNTAX; }
+
+  var added: int64 := 0;
+  var sawVersions: bool := false;
+
+  p := ixWs(buf, p);
+  if peek8(buf + p) as int64 == 125 { return 0; }
+
+  while true {
+    p := ixWs(buf, p);
+    var key: int64 := alloc(IX_STR_MAX);
+    p := ixString(buf, p, key, IX_STR_MAX);
+    if p < 0 { free(key, IX_STR_MAX); return IX_ERR_SYNTAX; }
+    p := ixExpect(buf, p, 58);
+    if p < 0 { free(key, IX_STR_MAX); return IX_ERR_SYNTAX; }
+
+    var isName: bool := StrCmp(key as pchar, "name"c) == 0;
+    var isVers: bool := StrCmp(key as pchar, "versions"c) == 0;
+    free(key, IX_STR_MAX);
+
+    if isName {
+      p := ixWs(buf, p);
+      var got: int64 := alloc(IX_STR_MAX);
+      p := ixString(buf, p, got, IX_STR_MAX);
+      if p < 0 { free(got, IX_STR_MAX); return IX_ERR_SYNTAX; }
+      var mismatch: bool := StrCmp(got as pchar, name) != 0;
+      free(got, IX_STR_MAX);
+      if mismatch { return IX_ERR_NAME; }
+    } else if isVers {
+      sawVersions := true;
+      p := ixVersions(buf, p, name, cat);
+      if p < 0 { return IX_ERR_SYNTAX; }
+      added := ixLastCount;
+      if added < 0 { return IX_ERR_LIMIT; }
+    } else {
+      p := ixSkipValue(buf, p);
+      if p < 0 { return IX_ERR_SYNTAX; }
+    }
+
+    p := ixWs(buf, p);
+    var c: int64 := peek8(buf + p) as int64;
+    if c == 44 { p := p + 1; }
+    else if c == 125 { break; }
+    else { return IX_ERR_SYNTAX; }
+  }
+
+  if !sawVersions { return IX_ERR_SYNTAX; }
+  return added;
+}
+
+// Liest das versions-Array und traegt jede nicht zurueckgezogene Version in
+// den Katalog ein. Rueckgabe: Position hinter dem Array, oder -1.
+fn ixVersions(buf: int64, i: int64, name: pchar, cat: DepCatalog): int64 {
+  ixLastCount := 0;
+  var p: int64 := ixExpect(buf, i, 91);
+  if p < 0 { return 0 - 1; }
+
+  p := ixWs(buf, p);
+  if peek8(buf + p) as int64 == 93 { return p + 1; }
+
+  while true {
+    p := ixExpect(buf, p, 123);
+    if p < 0 { return 0 - 1; }
+
+    var ver:  int64 := alloc(IX_STR_MAX);
+    var sha:  int64 := alloc(IX_STR_MAX);
+    var src:  int64 := alloc(IX_STR_MAX);
+    poke8(ver, 0); poke8(sha, 0); poke8(src, 0);
+    var yanked: bool := false;
+
+    var depNames: int64 := alloc(IX_MAX_DEPS * 8);
+    var depCons:  int64 := alloc(IX_MAX_DEPS * 8);
+    var depCntBox: int64 := alloc(8);
+    poke64(depCntBox, 0);
+
+    p := ixWs(buf, p);
+    if peek8(buf + p) as int64 != 125 {
+      while true {
+        p := ixWs(buf, p);
+        var key: int64 := alloc(IX_STR_MAX);
+        p := ixString(buf, p, key, IX_STR_MAX);
+        if p < 0 { free(key, IX_STR_MAX); return 0 - 1; }
+        p := ixExpect(buf, p, 58);
+        if p < 0 { free(key, IX_STR_MAX); return 0 - 1; }
+
+        var k: pchar := key as pchar;
+        if StrCmp(k, "version"c) == 0 {
+          p := ixWs(buf, p);
+          p := ixString(buf, p, ver, IX_STR_MAX);
+        } else if StrCmp(k, "sha256"c) == 0 {
+          p := ixWs(buf, p);
+          p := ixString(buf, p, sha, IX_STR_MAX);
+        } else if StrCmp(k, "source"c) == 0 {
+          p := ixWs(buf, p);
+          p := ixString(buf, p, src, IX_STR_MAX);
+        } else if StrCmp(k, "dependencies"c) == 0 {
+          p := ixDeps(buf, p, depNames, depCons, depCntBox);
+        } else if StrCmp(k, "yanked"c) == 0 {
+          p := ixWs(buf, p);
+          if peek8(buf + p) as int64 == 116 { yanked := true; }
+          p := ixSkipValue(buf, p);
+        } else {
+          p := ixSkipValue(buf, p);
+        }
+        free(key, IX_STR_MAX);
+        if p < 0 { return 0 - 1; }
+
+        p := ixWs(buf, p);
+        var c2: int64 := peek8(buf + p) as int64;
+        if c2 == 44 { p := p + 1; }
+        else if c2 == 125 { p := p + 1; break; }
+        else { return 0 - 1; }
+      }
+    } else {
+      p := p + 1;
+    }
+
+    var depCnt: int64 := peek64(depCntBox);
+
+    // Ohne Version ist der Eintrag unbrauchbar; zurueckgezogene ueberspringen.
+    var usable: bool := true;
+    if peek8(ver) as int64 == 0 { usable := false; }
+    if yanked { usable := false; }
+
+    if usable {
+      var pv: int64 := cat.DcAddPkg(name, ver as pchar, sha as pchar, src as pchar);
+      if pv < 0 {
+        ixLastCount := 0 - 1;
+      } else {
+        var d: int64 := 0;
+        while d < depCnt {
+          cat.DcAddDep(pv, peek64(depNames + d * 8) as pchar,
+                           peek64(depCons  + d * 8) as pchar);
+          d := d + 1;
+        }
+        if ixLastCount >= 0 { ixLastCount := ixLastCount + 1; }
+      }
+    }
+
+    var f: int64 := 0;
+    while f < depCnt {
+      free(peek64(depNames + f * 8), IX_STR_MAX);
+      free(peek64(depCons  + f * 8), IX_STR_MAX);
+      f := f + 1;
+    }
+    free(depNames, IX_MAX_DEPS * 8);
+    free(depCons,  IX_MAX_DEPS * 8);
+    free(depCntBox, 8);
+    free(ver, IX_STR_MAX);
+    free(sha, IX_STR_MAX);
+    free(src, IX_STR_MAX);
+
+    p := ixWs(buf, p);
+    var c3: int64 := peek8(buf + p) as int64;
+    if c3 == 44 { p := p + 1; }
+    else if c3 == 93 { p := p + 1; break; }
+    else { return 0 - 1; }
+  }
+
+  return p;
+}

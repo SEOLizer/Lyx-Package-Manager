@@ -199,8 +199,10 @@ lyx-lpm/
       cache.lyx            Lokaler Paket-Cache unter ~/.lpm/
       archive.lyx          .lxpkg entpacken (zstd + tar), SHA256-Pruefung
       resolver.lyx         Versions-Katalog, Auflösung, Konflikte, Topo-Sort
+      index.lyx            Parser für die Registry-Indizes (JSON)
   tests/
     resolver_test.lyx      Resolver-Tests (ohne Netz und Dateisystem)
+    index_test.lyx         Parser-Tests
 ```
 
 ### Warum der `std.*`-Baum
@@ -257,6 +259,12 @@ unvereinbaren Constraints und sortiert topologisch. 28 Tests, `make test`.
 Der Resolver hängt nicht am Netzwerk: seine Datenquelle ist ein `DepCatalog`,
 den PM-05 aus dem Registry-Index füllt und die Tests direkt befüllen.
 
+Von PM-05 ist der Index-Parser fertig (`lpm/core/index.lyx`): er liest
+`/packages/<name>/index.json` in den `DepCatalog`, überspringt `yanked`-Versionen,
+überliest unbekannte Schlüssel und lehnt einen Index ab, dessen `name` nicht zum
+angeforderten Paket passt. Der HTTPS-Transport fehlt noch — siehe unten, `getpid`
+wird vom seccomp-Filter blockiert, sobald OpenSSL ins Spiel kommt.
+
 Ursprünglich war eine Go-Implementierung für V1 mit späterem Port nach Lyx
 vorgesehen. Das Self-Hosting wurde vorgezogen — `lpm` ist von Beginn an in Lyx
 geschrieben.
@@ -311,6 +319,11 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
 
   Für Releases ist das keine Option: ein Paketmanager, der fremde Archive
   entpackt, soll seccomp und landlock gerade nicht abschalten.
+- **HTTPS ist mit aktivem LCBS derzeit gar nicht nutzbar** (gleiches Issue):
+  `std.net.https` linkt gegen OpenSSL, und OpenSSL ruft beim Init `getpid` —
+  das steht ebenfalls nicht im Filter, der Prozess stirbt vor dem
+  Verbindungsaufbau. Nebenwirkung: sobald `std.net.tls` importiert wird, ist das
+  Binary nicht mehr statisch gelinkt.
 - **`&&` schließt in `lyxc` nicht kurz.** `if p != null && deref(p)` wertet
   beide Seiten aus und segfaultet bei Nullzeigern. Null-Checks müssen
   geschachtelt werden.

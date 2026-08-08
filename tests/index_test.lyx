@@ -1,0 +1,220 @@
+// tests/index_test.lyx
+// WP-PM-05: Tests fuer den Registry-Index-Parser. Kein Netz, kein Dateisystem —
+// die JSON-Dokumente stehen als Literale im Test.
+//
+// Bauen und ausfuehren:  make test
+
+@description("lpm registry index parser tests")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.write, system.exit])
+unit main;
+
+import std.io grant [fs.read, fs.write];
+import lpm.core.semver grant [fs.read, fs.write];
+import lpm.core.lockfile grant [fs.read, fs.write];
+import lpm.core.resolver grant [fs.read, fs.write];
+import lpm.core.index grant [fs.read, fs.write];
+
+var tsPass: int64 := 0;
+var tsFail: int64 := 0;
+
+fn out(s: pchar): void {
+  if s == 0 as pchar { sys_write(1, "(null)"c as int64, 6); return; }
+  sys_write(1, s as int64, StrLen(s));
+}
+fn outLn(s: pchar): void { out(s); sys_write(1, "\n"c as int64, 1); }
+
+fn ok(name: pchar, cond: bool): void {
+  if cond {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); outLn(name);
+  }
+}
+
+fn okStr(name: pchar, got: pchar, want: pchar): void {
+  var same: bool := false;
+  if got != 0 as pchar {
+    if StrCmp(got, want) == 0 { same := true; }
+  }
+  if same {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); out(name); out("  erwartet="c); out(want);
+    out(" bekommen="c); outLn(got);
+  }
+}
+
+fn okInt(name: pchar, got: int64, want: int64): void {
+  if got == want {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); out(name); out("  erwartet="c); PrintInt(want);
+    out(" bekommen="c); PrintInt(got); outLn(""c);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Vollstaendiger Paket-Index
+// ---------------------------------------------------------------------------
+
+fn testFull(): void {
+  outLn("vollstaendiger Paket-Index"c);
+  var json: pchar := "{\n  \"name\": \"net/http\",\n  \"versions\": [\n    {\n      \"version\": \"1.2.0\",\n      \"sha256\": \"aaaa\",\n      \"source\": \"https://lpm.seolizer.de/packages/net/http/1.2.0.lxpkg\",\n      \"publisher\": \"roene\",\n      \"dependencies\": { \"std/io\": \">=1.0.0\", \"std/buffer\": \"^2.1.0\" },\n      \"yanked\": false\n    },\n    {\n      \"version\": \"1.3.0\",\n      \"sha256\": \"bbbb\",\n      \"source\": \"https://lpm.seolizer.de/packages/net/http/1.3.0.lxpkg\",\n      \"dependencies\": {},\n      \"yanked\": false\n    }\n  ]\n}"c;
+
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var n: int64 := IxParsePackageIndex(json, "net/http"c, cat);
+
+  okInt("zwei Versionen"c, n, 2);
+  okInt("im Katalog"c, cat.DcCount(), 2);
+  okStr("Name"c, cat.DcName(0), "net/http"c);
+  okStr("Version 0"c, cat.DcVer(0), "1.2.0"c);
+  okStr("sha256 0"c, cat.DcSha256(0), "aaaa"c);
+  okStr("source 0"c, cat.DcSource(0),
+        "https://lpm.seolizer.de/packages/net/http/1.2.0.lxpkg"c);
+  okInt("zwei Dependencies"c, cat.DcDepCount(0), 2);
+  okStr("dep 0 Name"c, cat.DcDepName(0, 0), "std/io"c);
+  okStr("dep 0 Constraint"c, cat.DcDepCons(0, 0), ">=1.0.0"c);
+  okStr("dep 1 Name"c, cat.DcDepName(0, 1), "std/buffer"c);
+  okStr("dep 1 Constraint"c, cat.DcDepCons(0, 1), "^2.1.0"c);
+  okStr("Version 1"c, cat.DcVer(1), "1.3.0"c);
+  okInt("keine Dependencies"c, cat.DcDepCount(1), 0);
+
+  // Unbekannter Schluessel ("publisher") hat nichts kaputtgemacht
+  ok("unbekannter Schluessel ueberlesen"c, cat.DcCount() == 2);
+
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 2. Zurueckgezogene Version wird nicht aufgenommen
+// ---------------------------------------------------------------------------
+
+fn testYanked(): void {
+  outLn("yanked wird uebersprungen"c);
+  var json: pchar := "{\"name\":\"A\",\"versions\":[{\"version\":\"1.0.0\",\"sha256\":\"x\",\"source\":\"s\",\"yanked\":true},{\"version\":\"1.1.0\",\"sha256\":\"y\",\"source\":\"s\",\"yanked\":false}]}"c;
+
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var n: int64 := IxParsePackageIndex(json, "A"c, cat);
+
+  okInt("eine Version aufgenommen"c, n, 1);
+  okStr("die nicht zurueckgezogene"c, cat.DcVer(0), "1.1.0"c);
+
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Index gehoert zu einem anderen Paket
+// ---------------------------------------------------------------------------
+
+fn testWrongName(): void {
+  outLn("falscher Paketname im Index"c);
+  var json: pchar := "{\"name\":\"boese/paket\",\"versions\":[{\"version\":\"1.0.0\"}]}"c;
+
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var n: int64 := IxParsePackageIndex(json, "net/http"c, cat);
+
+  okInt("wird abgelehnt"c, n, IX_ERR_NAME);
+  okInt("nichts uebernommen"c, cat.DcCount(), 0);
+
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Kaputtes JSON
+// ---------------------------------------------------------------------------
+
+fn testBroken(): void {
+  outLn("kaputtes JSON"c);
+
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+
+  okInt("kein Objekt"c, IxParsePackageIndex("[1,2,3]"c, "A"c, cat), IX_ERR_SYNTAX);
+  okInt("abgeschnitten"c, IxParsePackageIndex("{\"name\":\"A\",\"versions\":[{\"version\":"c, "A"c, cat), IX_ERR_SYNTAX);
+  okInt("kein versions-Feld"c, IxParsePackageIndex("{\"name\":\"A\"}"c, "A"c, cat), IX_ERR_SYNTAX);
+  okInt("leeres Objekt"c, IxParsePackageIndex("{}"c, "A"c, cat), 0);
+
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Leeres versions-Array
+// ---------------------------------------------------------------------------
+
+fn testEmptyVersions(): void {
+  outLn("leeres versions-Array"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var n: int64 := IxParsePackageIndex("{\"name\":\"A\",\"versions\":[]}"c, "A"c, cat);
+  okInt("null Versionen"c, n, 0);
+  okInt("Katalog leer"c, cat.DcCount(), 0);
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Parser + Resolver zusammen: Index -> Katalog -> Aufloesung
+// ---------------------------------------------------------------------------
+
+fn testEndToEnd(): void {
+  outLn("Index -> Katalog -> Aufloesung"c);
+  var httpJson: pchar := "{\"name\":\"net/http\",\"versions\":[{\"version\":\"1.2.0\",\"sha256\":\"h12\",\"source\":\"u1\",\"dependencies\":{\"std/io\":\"^1.0.0\"}}]}"c;
+  var ioJson: pchar := "{\"name\":\"std/io\",\"versions\":[{\"version\":\"1.0.0\",\"sha256\":\"i10\",\"source\":\"u2\"},{\"version\":\"1.7.2\",\"sha256\":\"i17\",\"source\":\"u3\"}]}"c;
+
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  ok("http-Index gelesen"c, IxParsePackageIndex(httpJson, "net/http"c, cat) == 1);
+  ok("io-Index gelesen"c, IxParsePackageIndex(ioJson, "std/io"c, cat) == 2);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("net/http"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("aufgeloest"c, rc == RS_OK);
+  okInt("zwei Pakete"c, r.RsCount(), 2);
+  okStr("std/io zuerst"c, r.RsName(0), "std/io"c);
+  okStr("hoechste passende io-Version"c, r.RsVer(0), "1.7.2"c);
+  okStr("dann net/http"c, r.RsName(1), "net/http"c);
+
+  var lock: LockFile := new LockFile();
+  lock.LfInit();
+  r.RsToLock(lock);
+  var idx: int64 := lock.LfFind("std/io"c);
+  okStr("sha256 aus dem Index gepinnt"c, lock.LfGetSha256(idx), "i17"c);
+
+  lock.LfFree(); dispose lock;
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  outLn("index tests"c);
+  outLn(""c);
+  testFull();
+  testYanked();
+  testWrongName();
+  testBroken();
+  testEmptyVersions();
+  testEndToEnd();
+
+  outLn(""c);
+  out("bestanden: "c); PrintInt(tsPass);
+  out("   fehlgeschlagen: "c); PrintInt(tsFail);
+  outLn(""c);
+
+  if tsFail > 0 { return 1; }
+  return 0;
+}
