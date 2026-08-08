@@ -399,6 +399,15 @@ pub type Resolver = class {
     var consBuf: int64 := peek64(s + SE_CONS);
     var reqBuf: int64 := peek64(s + SE_REQ);
     self.rsErrPkg := peek64(s + SE_NAME) as pchar;
+
+    // Nur eine Forderung: kein Konflikt zwischen zweien, sondern schlicht keine
+    // passende Version. Dann darf auch nur diese eine genannt werden.
+    if consN < 2 {
+      self.rsErrA := peek64(consBuf) as pchar;
+      self.rsErrB := 0 as pchar;
+      return;
+    }
+
     // Das zuletzt hinzugefuegte Constraint ist der Ausloeser.
     self.rsErrB := peek64(consBuf + (consN - 1) * 8) as pchar;
     self.rsErrA := 0 as pchar;

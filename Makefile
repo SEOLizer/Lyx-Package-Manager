@@ -9,6 +9,9 @@ SRCS := main.lyx \
         lpm/core/dirent.lyx \
         lpm/core/cache.lyx \
         lpm/core/archive.lyx \
+        lpm/core/resolver.lyx \
+        lpm/core/index.lyx \
+        lpm/core/localcat.lyx \
         lpm/cli/args.lyx \
         lpm/cli/commands.lyx
 

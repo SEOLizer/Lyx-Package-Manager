@@ -17,6 +17,10 @@ import lpm.core.lockfile;
 import lpm.core.dirent;
 import lpm.core.cache;
 import lpm.core.archive;
+import lpm.core.semver;
+import lpm.core.resolver;
+import lpm.core.index;
+import lpm.core.localcat;
 
 // ---------------------------------------------------------------------------
 // Schreib-Hilfsfunktionen (via sys_write — kein io-Import nötig)
@@ -84,12 +88,12 @@ fn lpmHelp(): void {
   cmdOutLn(""c);
   cmdOutLn("Subcommands:"c);
   cmdOutLn("  init [--name=<name>]   Neues Paket anlegen (erstellt lyx.toml)"c);
-  cmdOutLn("  install [<pkg>]        Paket installieren / alle Dependencies"c);
+  cmdOutLn("  install [<pkg[@ver]>]  Auflösen und lyx.lock schreiben"c);
   cmdOutLn("  remove <pkg>           Paket aus lyx.toml entfernen"c);
   cmdOutLn("  update [<pkg>]         Paket(e) aktualisieren"c);
   cmdOutLn("  search <query>         Registry durchsuchen"c);
   cmdOutLn("  info <pkg>             Paketdetails anzeigen"c);
-  cmdOutLn("  list                   Installierte Pakete anzeigen"c);
+  cmdOutLn("  list                   Aufgelöste Pakete aus lyx.lock anzeigen"c);
   cmdOutLn("  publish                Paket in Registry hochladen"c);
   cmdOutLn("  login                  Registry-Authentifizierung"c);
   cmdOutLn("  resolve <pkg>          Import-Auflösung für lyxc (intern)"c);
@@ -233,6 +237,347 @@ fn lpmCacheAdd(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
 }
 
 // ---------------------------------------------------------------------------
+// WP-PM-06: Install-Flow
+//
+// Manifest -> Katalog -> Resolver -> lyx.lock. Der Katalog kommt aus dem
+// lokalen Cache und dem gespiegelten Registry-Index; der HTTPS-Transport, der
+// diesen Spiegel fuellt, fehlt noch (LyX-Compiler#1185). Was aufgeloest ist,
+// aber nicht im Cache liegt, wird deshalb ausgewiesen statt heruntergeladen.
+// ---------------------------------------------------------------------------
+
+con CMD_RES_OK:         int64 := 0;
+con CMD_RES_FAIL:       int64 := 1;
+con CMD_RES_INCOMPLETE: int64 := 2;
+
+// Baut den Katalog aus allen lokal verfuegbaren Quellen auf.
+fn cmdBuildCatalog(home: pchar, cat: DepCatalog, verbose: bool): void {
+  var cacheDir: pchar := LpmCacheDir(home);
+  var fromCache: int64 := LcFromCache(cacheDir, cat);
+  LpmCacheFreePath(cacheDir);
+
+  var regDir: pchar := LpmCacheRegistryDir(home);
+  var fromIndex: int64 := LcFromIndexDir(regDir, cat);
+  LpmCacheFreePath(regDir);
+
+  if verbose {
+    cmdOut("lpm: Katalog: "c); PrintInt(fromCache);
+    cmdOut(" aus dem Cache, "c); PrintInt(fromIndex);
+    cmdOutLn(" aus gespiegelten Indizes."c);
+  }
+}
+
+// Traegt alle Dependencies des Manifests als Wurzeln ein.
+fn cmdAddRoots(mf: Manifest, r: Resolver): void {
+  var i: int64 := 0;
+  while i < mf.MfDepCount() {
+    r.RsAddRoot(mf.MfDepName(i), mf.MfDepVer(i));
+    i := i + 1;
+  }
+}
+
+// Gibt einen Resolver-Fehler mit Kontext aus.
+fn cmdResolveErr(r: Resolver, rc: int64): void {
+  cmdOut("lpm: error: "c);
+  cmdOut(r.RsErrStr(rc));
+  var pkg: pchar := r.RsErrPkg();
+  if pkg != 0 as pchar {
+    cmdOut(" — "c);
+    cmdOut(pkg);
+  }
+  var a: pchar := r.RsErrConsA();
+  var b: pchar := r.RsErrConsB();
+  if a != 0 as pchar {
+    if b != 0 as pchar {
+      cmdOut(" ("c); cmdOut(a); cmdOut(" gegen "c); cmdOut(b); cmdOut(")"c);
+    } else {
+      cmdOut(" ("c); cmdOut(a); cmdOut(")"c);
+    }
+  }
+  cmdOutLn(""c);
+}
+
+// Erfuellt das vorhandene lyx.lock bereits alle Manifest-Constraints?
+// Dann wird nicht neu aufgeloest — zweites `lpm install` ohne Aenderung soll
+// nichts tun (Akzeptanzkriterium WP-PM-06).
+fn cmdLockSatisfies(mf: Manifest, lock: LockFile): bool {
+  var i: int64 := 0;
+  while i < mf.MfDepCount() {
+    var idx: int64 := lock.LfFind(mf.MfDepName(i));
+    if idx < 0 { return false; }
+    var v: SemVer := new SemVer();
+    v.SvParse(lock.LfGetVer(idx));
+    var ok: bool := false;
+    if v.svValid {
+      if v.SvSatisfies(mf.MfDepVer(i)) { ok := true; }
+    }
+    dispose v;
+    if !ok { return false; }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Loest auf und schreibt lyx.lock.
+// Rueckgabe: CMD_RES_OK, CMD_RES_FAIL (Aufloesung gescheitert) oder
+// CMD_RES_INCOMPLETE (aufgeloest, aber nicht alles liegt lokal vor).
+// Der Aufrufer muss die Faelle unterscheiden: bei CMD_RES_FAIL darf lyx.toml
+// nicht veraendert werden, sonst bleibt ein unaufloesbares Paket darin stehen.
+fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  cmdBuildCatalog(home, cat, ctx.lcVerbose);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  cmdAddRoots(mf, r);
+
+  var rc: int64 := r.RsResolve();
+  if rc != RS_OK {
+    cmdResolveErr(r, rc);
+    r.RsFree(); dispose r;
+    cat.DcFree(); dispose cat;
+    return CMD_RES_FAIL;
+  }
+
+  var lock: LockFile := new LockFile();
+  lock.LfInit();
+  r.RsToLock(lock);
+
+  var written: bool := lock.LfWrite("lyx.lock"c);
+  if !written { cmdErr("lyx.lock konnte nicht geschrieben werden."c); }
+
+  // Was fehlt noch im Cache?
+  var missing: int64 := 0;
+  var n: int64 := 0;
+  while n < r.RsCount() {
+    var nm: pchar := r.RsName(n);
+    var vr: pchar := r.RsVer(n);
+    if LpmCacheHas(home, nm, vr) {
+      if ctx.lcVerbose {
+        cmdOut("lpm: "c); cmdOut(nm); cmdOut("@"c); cmdOut(vr);
+        cmdOutLn(" liegt im Cache."c);
+      }
+    } else {
+      missing := missing + 1;
+      cmdOut("lpm: fehlt im Cache: "c); cmdOut(nm); cmdOut("@"c); cmdOutLn(vr);
+    }
+    n := n + 1;
+  }
+
+  cmdOut("lpm: "c); PrintInt(r.RsCount());
+  cmdOutLn(" Paket(e) aufgeloest, lyx.lock geschrieben."c);
+
+  if missing > 0 {
+    cmdOut("lpm: "c); PrintInt(missing);
+    cmdOutLn(" Paket(e) fehlen lokal. Download folgt mit WP-PM-05"c);
+    cmdOutLn("     (HTTPS ist blockiert: LyX-Compiler#1185)."c);
+    cmdOutLn("     Solange hilft: lpm cache add <archiv.lxpkg> <name> <version>"c);
+  }
+
+  lock.LfFree(); dispose lock;
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+
+  if !written { return CMD_RES_FAIL; }
+  if missing > 0 { return CMD_RES_INCOMPLETE; }
+  return CMD_RES_OK;
+}
+
+// Liest lyx.toml, legt es an wenn es fehlt.
+fn cmdLoadManifest(mf: Manifest): bool {
+  if FileExists("lyx.toml"c) { return mf.MfRead("lyx.toml"c); }
+  return false;
+}
+
+// Trennt "name@constraint" auf. Gibt das Constraint zurueck (Zeiger in einen
+// eigenen Puffer) und kuerzt name in place. Ohne '@' wird "latest" geliefert.
+fn cmdSplitSpec(spec: pchar, nameOut: int64, cap: int64): pchar {
+  var slen: int64 := StrLen(spec);
+  var at: int64 := 0 - 1;
+  var i: int64 := 0;
+  while i < slen {
+    if peek8(spec as int64 + i) as int64 == 64 { at := i; }
+    i := i + 1;
+  }
+  if at < 0 {
+    if slen >= cap { return 0 as pchar; }
+    memcpy(nameOut, spec as int64, slen);
+    poke8(nameOut + slen, 0);
+    return "latest"c;
+  }
+  if at >= cap { return 0 as pchar; }
+  memcpy(nameOut, spec as int64, at);
+  poke8(nameOut + at, 0);
+  return (spec as int64 + at + 1) as pchar;
+}
+
+fn lpmInstall(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var home: pchar := cmdGetHome(argc, argv);
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+
+  var haveToml: bool := cmdLoadManifest(mf);
+  var spec: pchar := ctx.LcSubArg(0);
+
+  if !haveToml {
+    if spec == 0 as pchar {
+      cmdErr("Kein lyx.toml in diesem Verzeichnis. Erst 'lpm init' ausfuehren."c);
+      mf.MfFree(); dispose mf;
+      return 1;
+    }
+    // `lpm install <pkg>` in leerem Verzeichnis legt das Manifest an.
+    mf.MfAddDep("__placeholder__"c, "*"c);
+    mf.MfRemoveDep("__placeholder__"c);
+  }
+
+  if spec != 0 as pchar {
+    var nameBuf: int64 := alloc(512);
+    var cons: pchar := cmdSplitSpec(spec, nameBuf, 512);
+    if cons == 0 as pchar {
+      cmdErr("Paketname zu lang."c);
+      free(nameBuf, 512);
+      mf.MfFree(); dispose mf;
+      return 1;
+    }
+    // Nur im Speicher — geschrieben wird erst, wenn die Aufloesung haelt.
+    mf.MfSetDep(nameBuf as pchar, cons);
+    free(nameBuf, 512);
+  }
+
+  if mf.MfDepCount() == 0 {
+    cmdOutLn("lpm: keine Dependencies in lyx.toml — nichts zu tun."c);
+    mf.MfFree(); dispose mf;
+    return 0;
+  }
+
+  // Bereits geloestes Lock-File nicht neu berechnen.
+  if spec == 0 as pchar {
+    if FileExists("lyx.lock"c) {
+      var lock: LockFile := new LockFile();
+      lock.LfInit();
+      if lock.LfRead("lyx.lock"c) {
+        if cmdLockSatisfies(mf, lock) {
+          cmdOutLn("lpm: lyx.lock ist aktuell — nichts zu tun."c);
+          lock.LfFree(); dispose lock;
+          mf.MfFree(); dispose mf;
+          return 0;
+        }
+      }
+      lock.LfFree(); dispose lock;
+    }
+  }
+
+  var rc: int64 := cmdResolveAndLock(ctx, home, mf);
+
+  if rc == CMD_RES_FAIL {
+    if spec != 0 as pchar {
+      cmdOutLn("lpm: lyx.toml bleibt unveraendert."c);
+    }
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  if spec != 0 as pchar {
+    if !mf.MfWrite("lyx.toml"c) {
+      cmdErr("lyx.toml konnte nicht geschrieben werden."c);
+      mf.MfFree(); dispose mf;
+      return 1;
+    }
+  }
+
+  mf.MfFree(); dispose mf;
+  if rc == CMD_RES_INCOMPLETE { return 1; }
+  return 0;
+}
+
+fn lpmRemove(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var name: pchar := ctx.LcSubArg(0);
+  if name == 0 as pchar {
+    cmdErr("Verwendung: lpm remove <pkg>"c);
+    return 1;
+  }
+  if !FileExists("lyx.toml"c) {
+    cmdErr("Kein lyx.toml in diesem Verzeichnis."c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  if !mf.MfRead("lyx.toml"c) {
+    cmdErr("lyx.toml konnte nicht gelesen werden."c);
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  if !mf.MfRemoveDep(name) {
+    cmdOut("lpm: '"c); cmdOut(name);
+    cmdOutLn("' steht nicht in lyx.toml."c);
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  if !mf.MfWrite("lyx.toml"c) {
+    cmdErr("lyx.toml konnte nicht geschrieben werden."c);
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+  cmdOut("lpm: '"c); cmdOut(name); cmdOutLn("' aus lyx.toml entfernt."c);
+
+  if mf.MfDepCount() == 0 {
+    // Ohne Dependencies ist auch das Lock leer.
+    var empty: LockFile := new LockFile();
+    empty.LfInit();
+    empty.LfWrite("lyx.lock"c);
+    empty.LfFree(); dispose empty;
+    cmdOutLn("lpm: lyx.lock geleert."c);
+    mf.MfFree(); dispose mf;
+    return 0;
+  }
+
+  var rc: int64 := cmdResolveAndLock(ctx, home, mf);
+  if rc == CMD_RES_FAIL {
+    cmdOutLn("lpm: lyx.toml ist aktualisiert, lyx.lock aber unveraendert."c);
+  }
+  mf.MfFree(); dispose mf;
+  if rc == CMD_RES_OK { return 0; }
+  return 1;
+}
+
+fn lpmList(argc: int64, argv: pchar): int64 {
+  if !FileExists("lyx.lock"c) {
+    cmdOutLn("lpm: kein lyx.lock — erst 'lpm install' ausfuehren."c);
+    return 1;
+  }
+  var home: pchar := cmdGetHome(argc, argv);
+  var lock: LockFile := new LockFile();
+  lock.LfInit();
+  if !lock.LfRead("lyx.lock"c) {
+    cmdErr("lyx.lock konnte nicht gelesen werden."c);
+    lock.LfFree(); dispose lock;
+    return 1;
+  }
+
+  cmdOutLn("Aufgeloeste Pakete (lyx.lock):"c);
+  var i: int64 := 0;
+  var count: int64 := 0;
+  while true {
+    var nm: pchar := lock.LfGetName(i);
+    if nm == 0 as pchar { break; }
+    var vr: pchar := lock.LfGetVer(i);
+    cmdOut("  "c); cmdOut(nm); cmdOut("@"c); cmdOut(vr);
+    if LpmCacheHas(home, nm, vr) { cmdOutLn(""c); }
+    else { cmdOutLn("   (nicht im Cache)"c); }
+    count := count + 1;
+    i := i + 1;
+  }
+  if count == 0 { cmdOutLn("  (keine)"c); }
+
+  lock.LfFree(); dispose lock;
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Stubs für netzwerkabhängige Befehle
 // ---------------------------------------------------------------------------
 
@@ -255,12 +600,12 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   }
 
   if StrCmp(cmd, "init"c)    == 0 { return lpmInit(ctx); }
-  if StrCmp(cmd, "install"c) == 0 { return lpmNotImpl("install"c); }
-  if StrCmp(cmd, "remove"c)  == 0 { return lpmNotImpl("remove"c); }
+  if StrCmp(cmd, "install"c) == 0 { return lpmInstall(ctx, argc, argv); }
+  if StrCmp(cmd, "remove"c)  == 0 { return lpmRemove(ctx, argc, argv); }
   if StrCmp(cmd, "update"c)  == 0 { return lpmNotImpl("update"c); }
   if StrCmp(cmd, "search"c)  == 0 { return lpmNotImpl("search"c); }
   if StrCmp(cmd, "info"c)    == 0 { return lpmNotImpl("info"c); }
-  if StrCmp(cmd, "list"c)    == 0 { return lpmNotImpl("list"c); }
+  if StrCmp(cmd, "list"c)    == 0 { return lpmList(argc, argv); }
   if StrCmp(cmd, "publish"c) == 0 { return lpmNotImpl("publish"c); }
   if StrCmp(cmd, "login"c)   == 0 { return lpmNotImpl("login"c); }
   if StrCmp(cmd, "resolve"c) == 0 { return lpmNotImpl("resolve"c); }

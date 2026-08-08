@@ -70,12 +70,12 @@ lpm <subcommand> [optionen]
 | `lpm cache list` | Gecachte Pakete anzeigen | ✅ |
 | `lpm cache clean` | Lokalen Cache leeren | ✅ |
 | `lpm cache add <f> <n> <v>` | Lokales `.lxpkg` in den Cache entpacken | ⚠️ |
-| `lpm install [<pkg>]` | Paket bzw. alle Dependencies installieren | ⬜ |
-| `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen | ⬜ |
+| `lpm install [<pkg[@ver]>]` | Auflösen und `lyx.lock` schreiben | ⚠️ |
+| `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen, Lock neu schreiben | ✅ |
 | `lpm update [<pkg>]` | Paket(e) aktualisieren | ⬜ |
 | `lpm search <query>` | Registry durchsuchen | ⬜ |
 | `lpm info <pkg>` | Paketdetails anzeigen | ⬜ |
-| `lpm list` | Installierte Pakete anzeigen | ⬜ |
+| `lpm list` | Aufgelöste Pakete aus `lyx.lock` anzeigen | ✅ |
 | `lpm publish` | Paket in die Registry hochladen | ⬜ |
 | `lpm login` | Registry-Authentifizierung | ⬜ |
 | `lpm resolve <pkg>` | Import-Auflösung für `lyxc` (intern) | ⬜ |
@@ -200,10 +200,24 @@ lyx-lpm/
       archive.lyx          .lxpkg entpacken (zstd + tar), SHA256-Pruefung
       resolver.lyx         Versions-Katalog, Auflösung, Konflikte, Topo-Sort
       index.lyx            Parser für die Registry-Indizes (JSON)
+      localcat.lyx         Katalog aus Cache und gespiegelten Indizes
   tests/
     resolver_test.lyx      Resolver-Tests (ohne Netz und Dateisystem)
     index_test.lyx         Parser-Tests
 ```
+
+### Grenzen des Resolvers
+
+Die Auflösung ist greedy und ohne Backtracking: pro Paket wird die höchste
+Version genommen, die alle bisher gesammelten Constraints erfüllt. Führt eine
+solche Wahl später in eine Sackgasse, wird sie nicht zurückgenommen.
+
+Praktisch heißt das: fordert `net/http@latest` in Version 2.0.0 ein
+`std/io@^3.0.0`, das es nicht gibt, meldet `lpm` einen Konflikt — statt auf
+`net/http@1.2.0` zurückzufallen, das mit dem vorhandenen `std/io` liefe.
+Abhilfe bis dahin: das Constraint selbst enger fassen
+(`lpm install net/http@^1.0.0`). Backtracking ist bewusst zurückgestellt;
+die Spec sieht für V1 ausdrücklich Greedy vor.
 
 ### Warum der `std.*`-Baum
 
@@ -258,6 +272,14 @@ gesammelten Constraints erfüllt, meldet Diamant-Konflikte mit beiden
 unvereinbaren Constraints und sortiert topologisch. 28 Tests, `make test`.
 Der Resolver hängt nicht am Netzwerk: seine Datenquelle ist ein `DepCatalog`,
 den PM-05 aus dem Registry-Index füllt und die Tests direkt befüllen.
+
+PM-06 (`install`, `remove`, `list`) ist verdrahtet: Manifest → Katalog →
+Resolver → `lyx.lock`. Der Katalog kommt aus zwei lokalen Quellen — den
+entpackten Paketen unter `~/.lpm/cache/` (Dependencies aus deren `lyx.toml`)
+und den gespiegelten Registry-Indizes unter `~/.lpm/registry/packages/`.
+Ein zweites `lpm install` ohne Änderung rechnet nicht neu. Was aufgelöst ist,
+aber lokal fehlt, wird ausgewiesen statt heruntergeladen — der Download hängt
+am fehlenden HTTPS-Transport.
 
 Von PM-05 ist der Index-Parser fertig (`lpm/core/index.lyx`): er liest
 `/packages/<name>/index.json` in den `DepCatalog`, überspringt `yanked`-Versionen,

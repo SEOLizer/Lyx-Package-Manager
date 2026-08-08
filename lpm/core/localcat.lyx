@@ -1,0 +1,291 @@
+// lpm/core/localcat.lyx
+// WP-PM-06: Katalog-Quellen ohne Netzwerk.
+//
+// Der Resolver arbeitet gegen einen DepCatalog (siehe resolver.lyx). Woher der
+// kommt, entscheidet dieser Layer:
+//
+//   LcFromCache    — alles, was unter ~/.lpm/cache/ entpackt liegt. Die
+//                    Dependencies stehen in der lyx.toml des Pakets, also genau
+//                    dort, wo sie beim Packen hingeschrieben wurden.
+//
+//   LcFromIndexDir — die gespiegelten Registry-Indizes unter
+//                    ~/.lpm/registry/packages/<name>/index.json. Diesen Spiegel
+//                    fuellt spaeter der HTTPS-Transport (WP-PM-05); solange der
+//                    fehlt, kann man ihn von Hand befuellen, und `--offline`
+//                    arbeitet ohnehin nur darauf.
+//
+// Beide Quellen fuellen denselben Katalog und lassen sich kombinieren. Der
+// Cache kommt zuerst — was lokal liegt, ist bereits verifiziert.
+
+@description("lpm offline catalog sources")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.localcat;
+
+import std.io;
+import std.fs;
+import lpm.core.dirent;
+import lpm.core.manifest;
+import lpm.core.resolver;
+import lpm.core.index;
+
+con LC_PATH_MAX: int64 := 4096;
+con LC_JSON_MAX: int64 := 262144;
+
+// ---------------------------------------------------------------------------
+// Pfad-Hilfsfunktionen
+// ---------------------------------------------------------------------------
+
+fn lcAppend(buf: int64, pos: int64, s: pchar): int64 {
+  if s == 0 as pchar { return pos; }
+  var slen: int64 := StrLen(s);
+  if pos + slen >= LC_PATH_MAX { return pos; }
+  memcpy(buf + pos, s as int64, slen);
+  return pos + slen;
+}
+
+fn lcAppendN(buf: int64, pos: int64, s: int64, slen: int64): int64 {
+  if pos + slen >= LC_PATH_MAX { return pos; }
+  memcpy(buf + pos, s, slen);
+  return pos + slen;
+}
+
+fn lcEnd(buf: int64, pos: int64): void { poke8(buf + pos, 0); }
+
+// Beginnt der Name mit einer Ziffer? Dann ist es eine Versions-Ebene.
+// Gleiche Regel wie in cache.lyx — der Cache kommt ohne Zusatzmetadaten aus.
+fn lcIsVersionDir(name: pchar): bool {
+  if name == 0 as pchar { return false; }
+  var c: int64 := peek8(name as int64) as int64;
+  if c < 48 { return false; }
+  if c > 57 { return false; }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Cache -> Katalog
+// ---------------------------------------------------------------------------
+
+// Nimmt eine gecachte Paket-Version auf. Dependencies kommen aus deren
+// lyx.toml; fehlt sie, wird die Version trotzdem aufgenommen (ein Paket ohne
+// Dependencies ist zulaessig) — nur eben ohne Kanten.
+fn lcAddCached(cat: DepCatalog, name: pchar, ver: pchar, dirPath: int64): int64 {
+  // source zeigt auf das lokale Verzeichnis: ein Paket aus dem Cache muss
+  // nicht erneut heruntergeladen werden.
+  var pv: int64 := cat.DcAddPkg(name, ver, ""c, dirPath as pchar);
+  if pv < 0 { return 0; }
+
+  var tomlPath: int64 := alloc(LC_PATH_MAX);
+  var p: int64 := 0;
+  p := lcAppend(tomlPath, p, dirPath as pchar);
+  p := lcAppend(tomlPath, p, "/lyx.toml"c);
+  lcEnd(tomlPath, p);
+
+  if FileExists(tomlPath as pchar) {
+    var mf: Manifest := new Manifest();
+    mf.MfInit();
+    if mf.MfRead(tomlPath as pchar) {
+      var d: int64 := 0;
+      while d < mf.MfDepCount() {
+        cat.DcAddDep(pv, mf.MfDepName(d), mf.MfDepVer(d));
+        d := d + 1;
+      }
+    }
+    mf.MfFree();
+    dispose mf;
+  }
+
+  free(tomlPath, LC_PATH_MAX);
+  return 1;
+}
+
+// Laeuft durch den Cache-Baum. relName ist der bisher aufgebaute Paketname
+// ("net", dann "net/http"), depth begrenzt die Namens-Schachtelung.
+fn lcWalk(cat: DepCatalog, dirPath: int64, relName: int64, relLen: int64, depth: int64): int64 {
+  if depth > 3 { return 0; }
+
+  var dl: int64 := LpmDirOpen(dirPath as pchar);
+  if dl == 0 { return 0; }
+
+  var total: int64 := 0;
+  var n: int64 := LpmDirCount(dl);
+  var i: int64 := 0;
+  while i < n {
+    if LpmDirType(dl, i) == LPD_DT_DIR {
+      var ename: pchar := LpmDirName(dl, i);
+      var elen:  int64 := LpmDirNameLen(dl, i);
+
+      var subPath: int64 := alloc(LC_PATH_MAX);
+      var sp: int64 := 0;
+      sp := lcAppend(subPath, sp, dirPath as pchar);
+      poke8(subPath + sp, 47);
+      sp := sp + 1;
+      sp := lcAppendN(subPath, sp, ename as int64, elen);
+      lcEnd(subPath, sp);
+
+      if lcIsVersionDir(ename) {
+        if relLen > 0 {
+          lcEnd(relName, relLen);
+          total := total + lcAddCached(cat, relName as pchar, ename, subPath);
+        }
+      } else {
+        var subName: int64 := alloc(LC_PATH_MAX);
+        var np: int64 := 0;
+        if relLen > 0 {
+          np := lcAppendN(subName, np, relName, relLen);
+          poke8(subName + np, 47);
+          np := np + 1;
+        }
+        np := lcAppendN(subName, np, ename as int64, elen);
+        lcEnd(subName, np);
+
+        total := total + lcWalk(cat, subPath, subName, np, depth + 1);
+        free(subName, LC_PATH_MAX);
+      }
+
+      free(subPath, LC_PATH_MAX);
+    }
+    i := i + 1;
+  }
+
+  LpmDirClose(dl);
+  return total;
+}
+
+// Nimmt alle entpackten Pakete unter cacheDir in den Katalog auf.
+// Rueckgabe: Anzahl aufgenommener Paket-Versionen.
+pub fn LcFromCache(cacheDir: pchar, cat: DepCatalog): int64 {
+  if !IsDirectory(cacheDir) { return 0; }
+  var root: int64 := alloc(LC_PATH_MAX);
+  var p: int64 := lcAppend(root, 0, cacheDir);
+  lcEnd(root, p);
+  var empty: int64 := alloc(LC_PATH_MAX);
+  poke8(empty, 0);
+  var n: int64 := lcWalk(cat, root, empty, 0, 0);
+  free(empty, LC_PATH_MAX);
+  free(root, LC_PATH_MAX);
+  return n;
+}
+
+// ---------------------------------------------------------------------------
+// Gespiegelte Registry-Indizes -> Katalog
+// ---------------------------------------------------------------------------
+
+// Laeuft durch den Spiegel-Baum. Ein Verzeichnis, das eine index.json enthaelt,
+// ist ein Paket; sein Pfad relativ zu packages/ ist der Paketname.
+fn lcWalkIndex(cat: DepCatalog, dirPath: int64, relName: int64, relLen: int64, depth: int64): int64 {
+  if depth > 3 { return 0; }
+
+  var total: int64 := 0;
+
+  if relLen > 0 {
+    var idxPath: int64 := alloc(LC_PATH_MAX);
+    var ip: int64 := 0;
+    ip := lcAppend(idxPath, ip, dirPath as pchar);
+    ip := lcAppend(idxPath, ip, "/index.json"c);
+    lcEnd(idxPath, ip);
+    if FileExists(idxPath as pchar) {
+      lcEnd(relName, relLen);
+      var size: int64 := FileSize(idxPath as pchar);
+      if size > 0 {
+        if size <= LC_JSON_MAX {
+          var buf: int64 := alloc(size + 1);
+          var got: int64 := ReadFile(idxPath as pchar, buf as pchar, size);
+          if got > 0 {
+            poke8(buf + got, 0);
+            var rc: int64 := IxParsePackageIndex(buf as pchar, relName as pchar, cat);
+            if rc > 0 { total := total + rc; }
+          }
+          free(buf, size + 1);
+        }
+      }
+    }
+    free(idxPath, LC_PATH_MAX);
+  }
+
+  var dl: int64 := LpmDirOpen(dirPath as pchar);
+  if dl == 0 { return total; }
+
+  var n: int64 := LpmDirCount(dl);
+  var i: int64 := 0;
+  while i < n {
+    if LpmDirType(dl, i) == LPD_DT_DIR {
+      var ename: pchar := LpmDirName(dl, i);
+      var elen:  int64 := LpmDirNameLen(dl, i);
+
+      var subPath: int64 := alloc(LC_PATH_MAX);
+      var sp: int64 := 0;
+      sp := lcAppend(subPath, sp, dirPath as pchar);
+      poke8(subPath + sp, 47);
+      sp := sp + 1;
+      sp := lcAppendN(subPath, sp, ename as int64, elen);
+      lcEnd(subPath, sp);
+
+      var subName: int64 := alloc(LC_PATH_MAX);
+      var np: int64 := 0;
+      if relLen > 0 {
+        np := lcAppendN(subName, np, relName, relLen);
+        poke8(subName + np, 47);
+        np := np + 1;
+      }
+      np := lcAppendN(subName, np, ename as int64, elen);
+      lcEnd(subName, np);
+
+      total := total + lcWalkIndex(cat, subPath, subName, np, depth + 1);
+
+      free(subName, LC_PATH_MAX);
+      free(subPath, LC_PATH_MAX);
+    }
+    i := i + 1;
+  }
+
+  LpmDirClose(dl);
+  return total;
+}
+
+// Nimmt alle gespiegelten Paket-Indizes unter regDir/packages/ auf.
+pub fn LcFromIndexDir(regDir: pchar, cat: DepCatalog): int64 {
+  var root: int64 := alloc(LC_PATH_MAX);
+  var p: int64 := 0;
+  p := lcAppend(root, p, regDir);
+  p := lcAppend(root, p, "/packages"c);
+  lcEnd(root, p);
+
+  if !IsDirectory(root as pchar) { free(root, LC_PATH_MAX); return 0; }
+
+  var empty: int64 := alloc(LC_PATH_MAX);
+  poke8(empty, 0);
+  var n: int64 := lcWalkIndex(cat, root, empty, 0, 0);
+  free(empty, LC_PATH_MAX);
+  free(root, LC_PATH_MAX);
+  return n;
+}
+
+// Liest ~/.lpm/registry/packages/<name>/index.json fuer ein einzelnes Paket.
+// Rueckgabe: Anzahl aufgenommener Versionen, 0 wenn kein Spiegel vorliegt,
+// oder ein IX_ERR_*-Code bei kaputtem Index.
+pub fn LcFromIndexFile(regDir: pchar, name: pchar, cat: DepCatalog): int64 {
+  var path: int64 := alloc(LC_PATH_MAX);
+  var p: int64 := 0;
+  p := lcAppend(path, p, regDir);
+  p := lcAppend(path, p, "/packages/"c);
+  p := lcAppend(path, p, name);
+  p := lcAppend(path, p, "/index.json"c);
+  lcEnd(path, p);
+
+  if !FileExists(path as pchar) { free(path, LC_PATH_MAX); return 0; }
+
+  var size: int64 := FileSize(path as pchar);
+  if size <= 0 { free(path, LC_PATH_MAX); return 0; }
+  if size > LC_JSON_MAX { free(path, LC_PATH_MAX); return IX_ERR_LIMIT; }
+
+  var buf: int64 := alloc(size + 1);
+  var got: int64 := ReadFile(path as pchar, buf as pchar, size);
+  free(path, LC_PATH_MAX);
+  if got <= 0 { free(buf, size + 1); return 0; }
+  poke8(buf + got, 0);
+
+  var rc: int64 := IxParsePackageIndex(buf as pchar, name, cat);
+  free(buf, size + 1);
+  return rc;
+}
