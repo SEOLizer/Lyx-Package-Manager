@@ -1,0 +1,367 @@
+// tests/resolver_test.lyx
+// WP-PM-04: Tests fuer den Resolver. Laeuft ohne Netzwerk und ohne
+// Dateisystem — der Katalog wird direkt befuellt.
+//
+// Bauen und ausfuehren:  make test
+
+@description("lpm resolver tests")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.write, system.exit])
+unit main;
+
+import std.io grant [fs.read, fs.write];
+import lpm.core.semver grant [fs.read, fs.write];
+import lpm.core.lockfile grant [fs.read, fs.write];
+import lpm.core.resolver grant [fs.read, fs.write];
+
+var tsPass: int64 := 0;
+var tsFail: int64 := 0;
+
+fn out(s: pchar): void {
+  if s == 0 as pchar { sys_write(1, "(null)"c as int64, 6); return; }
+  sys_write(1, s as int64, StrLen(s));
+}
+fn outLn(s: pchar): void { out(s); sys_write(1, "\n"c as int64, 1); }
+
+fn ok(name: pchar, cond: bool): void {
+  if cond {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); outLn(name);
+  }
+}
+
+fn okStr(name: pchar, got: pchar, want: pchar): void {
+  var same: bool := false;
+  if got != 0 as pchar {
+    if StrCmp(got, want) == 0 { same := true; }
+  }
+  if same {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); out(name); out("  erwartet="c); out(want);
+    out(" bekommen="c); outLn(got);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 1. Transitive Kette ueber drei Stufen: app -> net/http -> std/io -> std/core
+// ---------------------------------------------------------------------------
+
+fn testChain(): void {
+  outLn("Kette ueber drei Stufen"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+
+  var a: int64 := cat.DcAddPkg("net/http"c, "1.2.0"c, "aa"c, "https://lpm.seolizer.de/packages/net/http/1.2.0.lxpkg"c);
+  cat.DcAddDep(a, "std/io"c, "^1.0.0"c);
+  var b: int64 := cat.DcAddPkg("std/io"c, "1.4.0"c, "bb"c, "src-io"c);
+  cat.DcAddDep(b, "std/core"c, ">=2.0.0"c);
+  cat.DcAddPkg("std/core"c, "2.1.0"c, "cc"c, "src-core"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("net/http"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("aufgeloest"c, rc == RS_OK);
+  ok("drei Pakete"c, r.RsCount() == 3);
+  // Installationsreihenfolge: Abhaengigkeiten zuerst
+  okStr("Reihenfolge 0"c, r.RsName(0), "std/core"c);
+  okStr("Reihenfolge 1"c, r.RsName(1), "std/io"c);
+  okStr("Reihenfolge 2"c, r.RsName(2), "net/http"c);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 2. Hoechste passende Version gewinnt
+// ---------------------------------------------------------------------------
+
+fn testHighest(): void {
+  outLn("hoechste passende Version"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  cat.DcAddPkg("buffer"c, "2.0.0"c, "x"c, "s"c);
+  cat.DcAddPkg("buffer"c, "2.3.1"c, "x"c, "s"c);
+  cat.DcAddPkg("buffer"c, "3.0.0"c, "x"c, "s"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("buffer"c, "^2.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("aufgeloest"c, rc == RS_OK);
+  okStr("waehlt 2.3.1 statt 3.0.0"c, r.RsVer(0), "2.3.1"c);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 3. Vertraeglicher Diamant: A->C@^1.0.0, B->C@^1.2.0  =>  C@1.4.0
+// ---------------------------------------------------------------------------
+
+fn testDiamondOk(): void {
+  outLn("vertraeglicher Diamant"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+
+  var a: int64 := cat.DcAddPkg("A"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(a, "C"c, "^1.0.0"c);
+  var b: int64 := cat.DcAddPkg("B"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(b, "C"c, "^1.2.0"c);
+  cat.DcAddPkg("C"c, "1.1.0"c, "x"c, "s"c);
+  cat.DcAddPkg("C"c, "1.4.0"c, "x"c, "s"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("A"c, "^1.0.0"c);
+  r.RsAddRoot("B"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("aufgeloest"c, rc == RS_OK);
+  ok("drei Pakete"c, r.RsCount() == 3);
+  okStr("C zuerst"c, r.RsName(0), "C"c);
+  okStr("C@1.4.0 erfuellt beide"c, r.RsVer(0), "1.4.0"c);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 4. Diamant-Konflikt: A->C@^1, B->C@^2  =>  Fehler mit beiden Constraints
+// ---------------------------------------------------------------------------
+
+fn testDiamondConflict(): void {
+  outLn("Diamant-Konflikt"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+
+  var a: int64 := cat.DcAddPkg("A"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(a, "C"c, "^1.0.0"c);
+  var b: int64 := cat.DcAddPkg("B"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(b, "C"c, "^2.0.0"c);
+  cat.DcAddPkg("C"c, "1.4.0"c, "x"c, "s"c);
+  cat.DcAddPkg("C"c, "2.0.0"c, "x"c, "s"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("A"c, "^1.0.0"c);
+  r.RsAddRoot("B"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("meldet Konflikt"c, rc == RS_ERR_CONFLICT);
+  okStr("nennt das Paket"c, r.RsErrPkg(), "C"c);
+  okStr("nennt Constraint A"c, r.RsErrConsA(), "^1.0.0"c);
+  okStr("nennt Constraint B"c, r.RsErrConsB(), "^2.0.0"c);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 5. Unbekanntes Paket
+// ---------------------------------------------------------------------------
+
+fn testMissing(): void {
+  outLn("unbekanntes Paket"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  cat.DcAddPkg("A"c, "1.0.0"c, "x"c, "s"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("gibtesnicht"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("meldet fehlendes Paket"c, rc == RS_ERR_MISSING);
+  okStr("nennt den Namen"c, r.RsErrPkg(), "gibtesnicht"c);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 6. Keine Version erfuellt das Constraint
+// ---------------------------------------------------------------------------
+
+fn testNoVersion(): void {
+  outLn("keine passende Version"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  cat.DcAddPkg("A"c, "1.0.0"c, "x"c, "s"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("A"c, "^9.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("meldet Konflikt"c, rc == RS_ERR_CONFLICT);
+  okStr("nennt das Paket"c, r.RsErrPkg(), "A"c);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 7. Zyklus: A -> B -> A
+// ---------------------------------------------------------------------------
+
+fn testCycle(): void {
+  outLn("zyklische Abhaengigkeit"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var a: int64 := cat.DcAddPkg("A"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(a, "B"c, "^1.0.0"c);
+  var b: int64 := cat.DcAddPkg("B"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(b, "A"c, "^1.0.0"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("A"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("meldet Zyklus"c, rc == RS_ERR_CYCLE);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 8. Nachtraegliche Verschaerfung: erst ^1.0.0, dann ~1.2.0
+// ---------------------------------------------------------------------------
+
+fn testTighten(): void {
+  outLn("nachtraeglich verschaerftes Constraint"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+
+  var a: int64 := cat.DcAddPkg("A"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(a, "C"c, "~1.2.0"c);
+  cat.DcAddPkg("C"c, "1.2.5"c, "x"c, "s"c);
+  cat.DcAddPkg("C"c, "1.9.0"c, "x"c, "s"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  // Root fordert nur ^1.0.0 — zuerst wuerde 1.9.0 gewaehlt, A verschaerft dann.
+  r.RsAddRoot("C"c, "^1.0.0"c);
+  r.RsAddRoot("A"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+
+  ok("aufgeloest"c, rc == RS_OK);
+  okStr("faellt auf 1.2.5 zurueck"c, r.RsVer(0), "1.2.5"c);
+
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 9. Lock-File-Uebergabe
+// ---------------------------------------------------------------------------
+
+fn testToLock(): void {
+  outLn("Ergebnis ins LockFile"c);
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var a: int64 := cat.DcAddPkg("net/http"c, "1.2.0"c, "deadbeef"c, "https://lpm.seolizer.de/packages/net/http/1.2.0.lxpkg"c);
+  cat.DcAddDep(a, "std/io"c, "^1.0.0"c);
+  cat.DcAddPkg("std/io"c, "1.4.0"c, "cafe"c, "https://lpm.seolizer.de/packages/std/io/1.4.0.lxpkg"c);
+
+  var r: Resolver := new Resolver();
+  r.RsInit(cat);
+  r.RsAddRoot("net/http"c, "^1.0.0"c);
+  var rc: int64 := r.RsResolve();
+  ok("aufgeloest"c, rc == RS_OK);
+
+  var lock: LockFile := new LockFile();
+  lock.LfInit();
+  r.RsToLock(lock);
+
+  var idx: int64 := lock.LfFind("net/http"c);
+  ok("net/http im Lock"c, idx >= 0);
+  okStr("Version gepinnt"c, lock.LfGetVer(idx), "1.2.0"c);
+  okStr("sha256 gepinnt"c, lock.LfGetSha256(idx), "deadbeef"c);
+  okStr("Quelle gepinnt"c, lock.LfGetSrc(idx),
+        "https://lpm.seolizer.de/packages/net/http/1.2.0.lxpkg"c);
+
+  lock.LfFree(); dispose lock;
+  r.RsFree(); dispose r;
+  cat.DcFree(); dispose cat;
+}
+
+// ---------------------------------------------------------------------------
+// 10. Determinismus: zweimal derselbe Katalog -> dieselbe Auswahl
+// ---------------------------------------------------------------------------
+
+fn resolveTwice(): bool {
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var a: int64 := cat.DcAddPkg("A"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(a, "C"c, "^1.0.0"c);
+  var b: int64 := cat.DcAddPkg("B"c, "1.0.0"c, "x"c, "s"c);
+  cat.DcAddDep(b, "C"c, "^1.1.0"c);
+  cat.DcAddPkg("C"c, "1.1.0"c, "x"c, "s"c);
+  cat.DcAddPkg("C"c, "1.5.0"c, "x"c, "s"c);
+
+  var r1: Resolver := new Resolver();
+  r1.RsInit(cat);
+  r1.RsAddRoot("A"c, "^1.0.0"c);
+  r1.RsAddRoot("B"c, "^1.0.0"c);
+  r1.RsResolve();
+
+  var r2: Resolver := new Resolver();
+  r2.RsInit(cat);
+  r2.RsAddRoot("A"c, "^1.0.0"c);
+  r2.RsAddRoot("B"c, "^1.0.0"c);
+  r2.RsResolve();
+
+  var same: bool := r1.RsCount() == r2.RsCount();
+  var i: int64 := 0;
+  while i < r1.RsCount() {
+    if StrCmp(r1.RsName(i), r2.RsName(i)) != 0 { same := false; }
+    if StrCmp(r1.RsVer(i),  r2.RsVer(i))  != 0 { same := false; }
+    i := i + 1;
+  }
+
+  r1.RsFree(); dispose r1;
+  r2.RsFree(); dispose r2;
+  cat.DcFree(); dispose cat;
+  return same;
+}
+
+fn testDeterminism(): void {
+  outLn("Determinismus"c);
+  ok("zwei Laeufe, gleiches Ergebnis"c, resolveTwice());
+}
+
+// ---------------------------------------------------------------------------
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  outLn("resolver tests"c);
+  outLn(""c);
+  testChain();
+  testHighest();
+  testDiamondOk();
+  testDiamondConflict();
+  testMissing();
+  testNoVersion();
+  testCycle();
+  testTighten();
+  testToLock();
+  testDeterminism();
+
+  outLn(""c);
+  out("bestanden: "c); PrintInt(tsPass);
+  out("   fehlgeschlagen: "c); PrintInt(tsFail);
+  outLn(""c);
+
+  if tsFail > 0 { return 1; }
+  return 0;
+}

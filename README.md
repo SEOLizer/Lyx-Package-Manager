@@ -198,6 +198,9 @@ lyx-lpm/
       dirent.lyx           Verzeichnis-Listing mit Index-Zugriff
       cache.lyx            Lokaler Paket-Cache unter ~/.lpm/
       archive.lyx          .lxpkg entpacken (zstd + tar), SHA256-Pruefung
+      resolver.lyx         Versions-Katalog, Auflösung, Konflikte, Topo-Sort
+  tests/
+    resolver_test.lyx      Resolver-Tests (ohne Netz und Dateisystem)
 ```
 
 ### Warum der `std.*`-Baum
@@ -235,7 +238,7 @@ Der ausführliche Fahrplan liegt im `aurum`-Repository unter
 | Meilenstein | Work Packages | Ergebnis | Status |
 |-------------|---------------|----------|--------|
 | M1 Offline-Grundlage | PM-01 – PM-03 | `init`, `cache`, lokale Pakete | 🟡 in Arbeit |
-| M2 Install-Flow | PM-04 – PM-06 | `install` gegen Registry | ⬜ |
+| M2 Install-Flow | PM-04 – PM-06 | `install` gegen Registry | 🟡 in Arbeit |
 | M3 Compiler-Integration | PM-07 | `lyxc` löst Imports automatisch auf | ⬜ |
 | M4 Ökosystem-Launch | PM-08 – PM-10 | `publish` + öffentliche Registry | ⬜ |
 | M5 Enterprise | PM-11 | Monorepo-/Workspace-Support | ⬜ |
@@ -246,6 +249,13 @@ Der ausführliche Fahrplan liegt im `aurum`-Repository unter
 (Entpacken, SHA256-Prüfung, Abwehr von Pfad-Traversal). Das Akzeptanzkriterium
 gilt trotzdem noch nicht als erfüllt, weil das Binary mit aktivem seccomp keine
 Verzeichnisse anlegen kann (LyX-Compiler#1185).
+
+PM-04 (Resolver) ist implementiert und getestet: `lpm/core/resolver.lyx` löst
+transitive Abhängigkeiten auf, wählt je Paket die höchste Version, die *alle*
+gesammelten Constraints erfüllt, meldet Diamant-Konflikte mit beiden
+unvereinbaren Constraints und sortiert topologisch. 28 Tests, `make test`.
+Der Resolver hängt nicht am Netzwerk: seine Datenquelle ist ein `DepCatalog`,
+den PM-05 aus dem Registry-Index füllt und die Tests direkt befüllen.
 
 Ursprünglich war eine Go-Implementierung für V1 mit späterem Port nach Lyx
 vorgesehen. Das Self-Hosting wurde vorgezogen — `lpm` ist von Beginn an in Lyx
@@ -271,8 +281,12 @@ Geplant für PM-10:
 
 ```bash
 make          # nach bin/lpm bauen
+make test     # Resolver-Tests bauen und ausführen
 make clean    # Binary entfernen
 ```
+
+`make test` braucht weder Netzwerk noch Schreibrechte und ist deshalb vom
+seccomp-Problem unten nicht betroffen.
 
 Beim Testen von `cache clean` empfiehlt sich ein separates `HOME`, damit der
 eigene Cache unangetastet bleibt:

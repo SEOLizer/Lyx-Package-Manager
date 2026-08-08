@@ -1,0 +1,592 @@
+// lpm/core/resolver.lyx
+// WP-PM-04: Abhaengigkeitsaufloesung.
+//
+// Zwei Bausteine:
+//
+//   DepCatalog — was es an Paketen gibt. Name, Version, sha256, Quelle und die
+//                Dependencies je Version. Der Katalog weiss nicht, woher die
+//                Daten kommen: WP-PM-05 fuellt ihn aus dem Registry-Index,
+//                Tests fuellen ihn direkt. Dadurch ist der Resolver ohne
+//                Netzwerk vollstaendig testbar.
+//
+//   Resolver   — welche Versionen daraus gewaehlt werden. Greedy: pro Paket
+//                immer die hoechste Version, die *alle* bisher gesehenen
+//                Constraints erfuellt. Reicht laut Spec fuer V1.
+//
+// Ablauf (RsResolve):
+//   1. Root-Constraints stehen in der Warteschlange
+//   2. Paket noch nicht gewaehlt -> hoechste passende Version waehlen,
+//      deren Dependencies anhaengen
+//   3. Paket schon gewaehlt -> neues Constraint dazunehmen und neu waehlen.
+//      Aendert sich die Version, kommen die Dependencies der neuen Version in
+//      die Warteschlange; die der alten bleiben drin, schaden aber nicht:
+//      sie werden als Constraints erneut geprueft.
+//   4. Erfuellt keine Version mehr alle Constraints -> Konflikt mit Angabe der
+//      beiden unvertraeglichen Forderungen
+//   5. Topologische Sortierung (Kahn) -> Installationsreihenfolge
+//
+// Determinismus: bei gleichem Katalog und gleichen Root-Constraints ist das
+// Ergebnis identisch — es wird nie zufaellig, sondern immer die hoechste
+// zulaessige Version gewaehlt, und die Topo-Sortierung bricht Gleichstaende
+// nach Auswahlreihenfolge.
+
+@description("lpm dependency resolver")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.resolver;
+
+import std.io;
+import lpm.core.semver;
+import lpm.core.lockfile;
+
+// ---------------------------------------------------------------------------
+// Konstanten
+// ---------------------------------------------------------------------------
+
+pub con RS_MAX_PV:   int64 := 512;    // Paket-Versionen im Katalog
+pub con RS_MAX_EDGE: int64 := 2048;   // Dependency-Kanten im Katalog
+pub con RS_MAX_SEL:  int64 := 256;    // gewaehlte Pakete
+pub con RS_MAX_CONS: int64 := 16;     // Constraints pro Paket
+pub con RS_MAX_QUEUE: int64 := 4096;  // offene Forderungen
+
+pub con RS_OK:           int64 := 0;
+pub con RS_ERR_MISSING:  int64 := 0 - 1;   // Paket im Katalog unbekannt
+pub con RS_ERR_CONFLICT: int64 := 0 - 2;   // keine Version erfuellt alle Constraints
+pub con RS_ERR_CYCLE:    int64 := 0 - 3;   // zyklische Abhaengigkeit
+pub con RS_ERR_LIMIT:    int64 := 0 - 4;   // Grenze erreicht (siehe RS_MAX_*)
+
+// Katalog-Record: Paket-Version (48 Bytes)
+con PV_SZ:    int64 := 48;
+con PV_NAME:  int64 := 0;
+con PV_VER:   int64 := 8;
+con PV_SHA:   int64 := 16;
+con PV_SRC:   int64 := 24;
+con PV_DEP0:  int64 := 32;   // Index der ersten Kante
+con PV_DEPN:  int64 := 40;   // Anzahl Kanten
+
+// Katalog-Record: Kante (16 Bytes)
+con ED_SZ:    int64 := 16;
+con ED_NAME:  int64 := 0;
+con ED_CONS:  int64 := 8;
+
+// Auswahl-Record (48 Bytes)
+con SE_SZ:    int64 := 48;
+con SE_NAME:  int64 := 0;    // Zeiger in den Katalog (nicht eigenstaendig)
+con SE_PV:    int64 := 8;    // gewaehlter Katalog-Index
+con SE_CONSN: int64 := 16;   // Anzahl Constraints
+con SE_CONS:  int64 := 24;   // Puffer: RS_MAX_CONS Zeiger auf Constraint-Strings
+con SE_REQ:   int64 := 32;   // Puffer: RS_MAX_CONS Zeiger auf Fordernde
+con SE_MARK:  int64 := 40;   // Arbeitsfeld fuer die Topo-Sortierung
+
+// Warteschlangen-Record (16 Bytes)
+con QU_SZ:    int64 := 16;
+con QU_NAME:  int64 := 0;
+con QU_CONS:  int64 := 8;
+
+// ---------------------------------------------------------------------------
+// Hilfsfunktionen
+// ---------------------------------------------------------------------------
+
+fn rsDup(s: pchar): pchar {
+  if s == 0 as pchar { return 0 as pchar; }
+  var slen: int64 := StrLen(s);
+  var dst: int64 := alloc(slen + 1);
+  memcpy(dst, s as int64, slen);
+  poke8(dst + slen, 0);
+  return dst as pchar;
+}
+
+fn rsFreeS(s: pchar): void {
+  if s != 0 as pchar { free(s as int64, StrLen(s) + 1); }
+}
+
+// Gleichheit zweier Strings, null-sicher.
+fn rsEq(a: pchar, b: pchar): bool {
+  if a == 0 as pchar { return false; }
+  if b == 0 as pchar { return false; }
+  return StrCmp(a, b) == 0;
+}
+
+// ---------------------------------------------------------------------------
+// DepCatalog — verfuegbare Pakete und deren Dependencies
+// ---------------------------------------------------------------------------
+
+pub type DepCatalog = class {
+  dcPv:    int64;
+  dcPvN:   int64;
+  dcEdge:  int64;
+  dcEdgeN: int64;
+
+  pub fn DcInit(): void {
+    self.dcPv    := alloc(RS_MAX_PV * PV_SZ);
+    self.dcPvN   := 0;
+    self.dcEdge  := alloc(RS_MAX_EDGE * ED_SZ);
+    self.dcEdgeN := 0;
+  }
+
+  pub fn DcFree(): void {
+    var i: int64 := 0;
+    while i < self.dcPvN {
+      var rec: int64 := self.dcPv + i * PV_SZ;
+      rsFreeS(peek64(rec + PV_NAME) as pchar);
+      rsFreeS(peek64(rec + PV_VER)  as pchar);
+      rsFreeS(peek64(rec + PV_SHA)  as pchar);
+      rsFreeS(peek64(rec + PV_SRC)  as pchar);
+      i := i + 1;
+    }
+    var k: int64 := 0;
+    while k < self.dcEdgeN {
+      var e: int64 := self.dcEdge + k * ED_SZ;
+      rsFreeS(peek64(e + ED_NAME) as pchar);
+      rsFreeS(peek64(e + ED_CONS) as pchar);
+      k := k + 1;
+    }
+    free(self.dcPv,   RS_MAX_PV * PV_SZ);
+    free(self.dcEdge, RS_MAX_EDGE * ED_SZ);
+  }
+
+  // Nimmt eine Paket-Version auf. Rueckgabe: Katalog-Index, oder -1 wenn voll.
+  // Dependencies werden danach mit DcAddDep an genau diesen Index gehaengt.
+  pub fn DcAddPkg(name: pchar, ver: pchar, sha256: pchar, source: pchar): int64 {
+    if self.dcPvN >= RS_MAX_PV { return 0 - 1; }
+    var idx: int64 := self.dcPvN;
+    var rec: int64 := self.dcPv + idx * PV_SZ;
+    poke64(rec + PV_NAME, rsDup(name)   as int64);
+    poke64(rec + PV_VER,  rsDup(ver)    as int64);
+    poke64(rec + PV_SHA,  rsDup(sha256) as int64);
+    poke64(rec + PV_SRC,  rsDup(source) as int64);
+    poke64(rec + PV_DEP0, self.dcEdgeN);
+    poke64(rec + PV_DEPN, 0);
+    self.dcPvN := idx + 1;
+    return idx;
+  }
+
+  // Haengt eine Dependency an die zuletzt aufgenommene Paket-Version.
+  // Kanten liegen zusammenhaengend, deshalb ist nur der letzte Eintrag
+  // erweiterbar — alles andere waere ein Fehler im Aufrufer.
+  pub fn DcAddDep(pvIdx: int64, depName: pchar, constraint: pchar): bool {
+    if pvIdx != self.dcPvN - 1 { return false; }
+    if self.dcEdgeN >= RS_MAX_EDGE { return false; }
+    var e: int64 := self.dcEdge + self.dcEdgeN * ED_SZ;
+    poke64(e + ED_NAME, rsDup(depName)    as int64);
+    poke64(e + ED_CONS, rsDup(constraint) as int64);
+    self.dcEdgeN := self.dcEdgeN + 1;
+    var rec: int64 := self.dcPv + pvIdx * PV_SZ;
+    poke64(rec + PV_DEPN, peek64(rec + PV_DEPN) + 1);
+    return true;
+  }
+
+  pub fn DcCount(): int64 { return self.dcPvN; }
+
+  pub fn DcName(idx: int64): pchar {
+    if idx < 0 { return 0 as pchar; }
+    if idx >= self.dcPvN { return 0 as pchar; }
+    return peek64(self.dcPv + idx * PV_SZ + PV_NAME) as pchar;
+  }
+
+  pub fn DcVer(idx: int64): pchar {
+    if idx < 0 { return 0 as pchar; }
+    if idx >= self.dcPvN { return 0 as pchar; }
+    return peek64(self.dcPv + idx * PV_SZ + PV_VER) as pchar;
+  }
+
+  pub fn DcSha256(idx: int64): pchar {
+    if idx < 0 { return 0 as pchar; }
+    if idx >= self.dcPvN { return 0 as pchar; }
+    return peek64(self.dcPv + idx * PV_SZ + PV_SHA) as pchar;
+  }
+
+  pub fn DcSource(idx: int64): pchar {
+    if idx < 0 { return 0 as pchar; }
+    if idx >= self.dcPvN { return 0 as pchar; }
+    return peek64(self.dcPv + idx * PV_SZ + PV_SRC) as pchar;
+  }
+
+  pub fn DcDepCount(idx: int64): int64 {
+    if idx < 0 { return 0; }
+    if idx >= self.dcPvN { return 0; }
+    return peek64(self.dcPv + idx * PV_SZ + PV_DEPN);
+  }
+
+  pub fn DcDepName(idx: int64, k: int64): pchar {
+    if k < 0 { return 0 as pchar; }
+    if k >= self.DcDepCount(idx) { return 0 as pchar; }
+    var base: int64 := peek64(self.dcPv + idx * PV_SZ + PV_DEP0);
+    return peek64(self.dcEdge + (base + k) * ED_SZ + ED_NAME) as pchar;
+  }
+
+  pub fn DcDepCons(idx: int64, k: int64): pchar {
+    if k < 0 { return 0 as pchar; }
+    if k >= self.DcDepCount(idx) { return 0 as pchar; }
+    var base: int64 := peek64(self.dcPv + idx * PV_SZ + PV_DEP0);
+    return peek64(self.dcEdge + (base + k) * ED_SZ + ED_CONS) as pchar;
+  }
+
+  // Gibt es das Paket ueberhaupt (in irgendeiner Version)?
+  pub fn DcHasPkg(name: pchar): bool {
+    var i: int64 := 0;
+    while i < self.dcPvN {
+      if rsEq(self.DcName(i), name) { return true; }
+      i := i + 1;
+    }
+    return false;
+  }
+
+  // Hoechste Version von name, die constraint erfuellt. -1 wenn keine passt.
+  pub fn DcBest(name: pchar, constraint: pchar): int64 {
+    var best: int64 := 0 - 1;
+    var i: int64 := 0;
+    while i < self.dcPvN {
+      if rsEq(self.DcName(i), name) {
+        var v: SemVer := new SemVer();
+        v.SvParse(self.DcVer(i));
+        if v.svValid {
+          if v.SvSatisfies(constraint) {
+            if best < 0 {
+              best := i;
+            } else {
+              var b: SemVer := new SemVer();
+              b.SvParse(self.DcVer(best));
+              if v.SvCmp(b) > 0 { best := i; }
+              dispose b;
+            }
+          }
+        }
+        dispose v;
+      }
+      i := i + 1;
+    }
+    return best;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Resolver
+// ---------------------------------------------------------------------------
+
+pub type Resolver = class {
+  rsCat:   DepCatalog;
+  rsSel:   int64;
+  rsSelN:  int64;
+  rsQueue: int64;
+  rsQHead: int64;
+  rsQTail: int64;
+  rsOrder: int64;    // Topo-Reihenfolge: Auswahl-Indizes
+  rsOrderN: int64;
+
+  // Fehlerkontext fuer die Meldung
+  rsErrPkg:  pchar;
+  rsErrA:    pchar;
+  rsErrB:    pchar;
+
+  pub fn RsInit(cat: DepCatalog): void {
+    self.rsCat    := cat;
+    self.rsSel    := alloc(RS_MAX_SEL * SE_SZ);
+    self.rsSelN   := 0;
+    self.rsQueue  := alloc(RS_MAX_QUEUE * QU_SZ);
+    self.rsQHead  := 0;
+    self.rsQTail  := 0;
+    self.rsOrder  := alloc(RS_MAX_SEL * 8);
+    self.rsOrderN := 0;
+    self.rsErrPkg := 0 as pchar;
+    self.rsErrA   := 0 as pchar;
+    self.rsErrB   := 0 as pchar;
+  }
+
+  pub fn RsFree(): void {
+    var i: int64 := 0;
+    while i < self.rsSelN {
+      var s: int64 := self.rsSel + i * SE_SZ;
+      free(peek64(s + SE_CONS), RS_MAX_CONS * 8);
+      free(peek64(s + SE_REQ),  RS_MAX_CONS * 8);
+      i := i + 1;
+    }
+    free(self.rsSel,   RS_MAX_SEL * SE_SZ);
+    free(self.rsQueue, RS_MAX_QUEUE * QU_SZ);
+    free(self.rsOrder, RS_MAX_SEL * 8);
+  }
+
+  // ---- Warteschlange ----
+
+  fn rsPush(name: pchar, constraint: pchar): bool {
+    if self.rsQTail >= RS_MAX_QUEUE { return false; }
+    var q: int64 := self.rsQueue + self.rsQTail * QU_SZ;
+    poke64(q + QU_NAME, name       as int64);
+    poke64(q + QU_CONS, constraint as int64);
+    self.rsQTail := self.rsQTail + 1;
+    return true;
+  }
+
+  // ---- Auswahl ----
+
+  fn rsFindSel(name: pchar): int64 {
+    var i: int64 := 0;
+    while i < self.rsSelN {
+      if rsEq(peek64(self.rsSel + i * SE_SZ + SE_NAME) as pchar, name) { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+
+  // Waehlt fuer eine Auswahl die hoechste Version, die alle ihre Constraints
+  // erfuellt. Rueckgabe: Katalog-Index oder -1.
+  fn rsBestForAll(selIdx: int64): int64 {
+    var s: int64 := self.rsSel + selIdx * SE_SZ;
+    var name: pchar := peek64(s + SE_NAME) as pchar;
+    var consN: int64 := peek64(s + SE_CONSN);
+    var consBuf: int64 := peek64(s + SE_CONS);
+
+    var best: int64 := 0 - 1;
+    var i: int64 := 0;
+    while i < self.rsCat.DcCount() {
+      if rsEq(self.rsCat.DcName(i), name) {
+        var v: SemVer := new SemVer();
+        v.SvParse(self.rsCat.DcVer(i));
+        if v.svValid {
+          var all: bool := true;
+          var c: int64 := 0;
+          while c < consN {
+            if !v.SvSatisfies(peek64(consBuf + c * 8) as pchar) { all := false; }
+            c := c + 1;
+          }
+          if all {
+            if best < 0 {
+              best := i;
+            } else {
+              var b: SemVer := new SemVer();
+              b.SvParse(self.rsCat.DcVer(best));
+              if v.SvCmp(b) > 0 { best := i; }
+              dispose b;
+            }
+          }
+        }
+        dispose v;
+      }
+      i := i + 1;
+    }
+    return best;
+  }
+
+  // Traegt ein Constraint bei einer Auswahl nach. false, wenn RS_MAX_CONS voll.
+  fn rsAddCons(selIdx: int64, constraint: pchar, reqBy: pchar): bool {
+    var s: int64 := self.rsSel + selIdx * SE_SZ;
+    var n: int64 := peek64(s + SE_CONSN);
+    if n >= RS_MAX_CONS { return false; }
+    poke64(peek64(s + SE_CONS) + n * 8, constraint as int64);
+    poke64(peek64(s + SE_REQ)  + n * 8, reqBy      as int64);
+    poke64(s + SE_CONSN, n + 1);
+    return true;
+  }
+
+  // Haengt die Dependencies der gewaehlten Version in die Warteschlange.
+  fn rsQueueDeps(pvIdx: int64): bool {
+    var k: int64 := 0;
+    var n: int64 := self.rsCat.DcDepCount(pvIdx);
+    while k < n {
+      if !self.rsPush(self.rsCat.DcDepName(pvIdx, k), self.rsCat.DcDepCons(pvIdx, k)) {
+        return false;
+      }
+      k := k + 1;
+    }
+    return true;
+  }
+
+  // Sucht das Constraint, das mit dem zuletzt hinzugefuegten unvertraeglich
+  // ist, und legt beide fuer die Fehlermeldung ab.
+  fn rsRecordConflict(selIdx: int64): void {
+    var s: int64 := self.rsSel + selIdx * SE_SZ;
+    var consN: int64 := peek64(s + SE_CONSN);
+    var consBuf: int64 := peek64(s + SE_CONS);
+    var reqBuf: int64 := peek64(s + SE_REQ);
+    self.rsErrPkg := peek64(s + SE_NAME) as pchar;
+    // Das zuletzt hinzugefuegte Constraint ist der Ausloeser.
+    self.rsErrB := peek64(consBuf + (consN - 1) * 8) as pchar;
+    self.rsErrA := 0 as pchar;
+    // Das erste Constraint, mit dem es keine gemeinsame Version gibt.
+    var c: int64 := 0;
+    while c < consN - 1 {
+      if self.rsErrA == 0 as pchar {
+        var found: bool := false;
+        var i: int64 := 0;
+        while i < self.rsCat.DcCount() {
+          if rsEq(self.rsCat.DcName(i), self.rsErrPkg) {
+            var v: SemVer := new SemVer();
+            v.SvParse(self.rsCat.DcVer(i));
+            if v.svValid {
+              if v.SvSatisfies(peek64(consBuf + c * 8) as pchar) {
+                if v.SvSatisfies(self.rsErrB) { found := true; }
+              }
+            }
+            dispose v;
+          }
+          i := i + 1;
+        }
+        if !found { self.rsErrA := peek64(consBuf + c * 8) as pchar; }
+      }
+      c := c + 1;
+    }
+    if self.rsErrA == 0 as pchar { self.rsErrA := peek64(consBuf) as pchar; }
+    // reqBuf wird derzeit nur fuer spaetere, ausfuehrlichere Meldungen gefuellt.
+    if reqBuf == 0 { return; }
+  }
+
+  // Nimmt eine Forderung auf: Paket waehlen oder Auswahl verfeinern.
+  fn rsApply(name: pchar, constraint: pchar, reqBy: pchar): int64 {
+    var selIdx: int64 := self.rsFindSel(name);
+
+    if selIdx < 0 {
+      if !self.rsCat.DcHasPkg(name) {
+        self.rsErrPkg := name;
+        self.rsErrA   := constraint;
+        self.rsErrB   := 0 as pchar;
+        return RS_ERR_MISSING;
+      }
+      if self.rsSelN >= RS_MAX_SEL { return RS_ERR_LIMIT; }
+      selIdx := self.rsSelN;
+      var s: int64 := self.rsSel + selIdx * SE_SZ;
+      poke64(s + SE_NAME,  name as int64);
+      poke64(s + SE_PV,    0 - 1);
+      poke64(s + SE_CONSN, 0);
+      poke64(s + SE_CONS,  alloc(RS_MAX_CONS * 8));
+      poke64(s + SE_REQ,   alloc(RS_MAX_CONS * 8));
+      poke64(s + SE_MARK,  0);
+      self.rsSelN := selIdx + 1;
+    }
+
+    if !self.rsAddCons(selIdx, constraint, reqBy) { return RS_ERR_LIMIT; }
+
+    var pv: int64 := self.rsBestForAll(selIdx);
+    if pv < 0 {
+      self.rsRecordConflict(selIdx);
+      return RS_ERR_CONFLICT;
+    }
+
+    var s2: int64 := self.rsSel + selIdx * SE_SZ;
+    var old: int64 := peek64(s2 + SE_PV);
+    if old != pv {
+      poke64(s2 + SE_PV, pv);
+      if !self.rsQueueDeps(pv) { return RS_ERR_LIMIT; }
+    }
+    return RS_OK;
+  }
+
+  // ---- Roots ----
+
+  // Traegt eine direkte Dependency des Root-Manifests ein.
+  pub fn RsAddRoot(name: pchar, constraint: pchar): bool {
+    return self.rsPush(name, constraint);
+  }
+
+  // ---- Aufloesung ----
+
+  pub fn RsResolve(): int64 {
+    while self.rsQHead < self.rsQTail {
+      var q: int64 := self.rsQueue + self.rsQHead * QU_SZ;
+      var name: pchar := peek64(q + QU_NAME) as pchar;
+      var cons: pchar := peek64(q + QU_CONS) as pchar;
+      self.rsQHead := self.rsQHead + 1;
+
+      var rc: int64 := self.rsApply(name, cons, 0 as pchar);
+      if rc != RS_OK { return rc; }
+    }
+    return self.rsTopoSort();
+  }
+
+  // Kahn: wiederholt alle Auswahlen nehmen, deren Dependencies bereits in der
+  // Reihenfolge stehen. Bleibt etwas uebrig, gibt es einen Zyklus.
+  fn rsTopoSort(): int64 {
+    var i: int64 := 0;
+    while i < self.rsSelN {
+      poke64(self.rsSel + i * SE_SZ + SE_MARK, 0);
+      i := i + 1;
+    }
+    self.rsOrderN := 0;
+
+    var progress: bool := true;
+    while progress {
+      progress := false;
+      var k: int64 := 0;
+      while k < self.rsSelN {
+        var s: int64 := self.rsSel + k * SE_SZ;
+        if peek64(s + SE_MARK) == 0 {
+          var pv: int64 := peek64(s + SE_PV);
+          var ready: bool := true;
+          var d: int64 := 0;
+          var dn: int64 := self.rsCat.DcDepCount(pv);
+          while d < dn {
+            var depName: pchar := self.rsCat.DcDepName(pv, d);
+            var depSel: int64 := self.rsFindSel(depName);
+            if depSel >= 0 {
+              if peek64(self.rsSel + depSel * SE_SZ + SE_MARK) == 0 { ready := false; }
+            }
+            d := d + 1;
+          }
+          if ready {
+            poke64(s + SE_MARK, 1);
+            poke64(self.rsOrder + self.rsOrderN * 8, k);
+            self.rsOrderN := self.rsOrderN + 1;
+            progress := true;
+          }
+        }
+        k := k + 1;
+      }
+    }
+
+    if self.rsOrderN != self.rsSelN {
+      // Uebrig gebliebene Auswahl benennen, damit die Meldung konkret wird.
+      var j: int64 := 0;
+      while j < self.rsSelN {
+        var s3: int64 := self.rsSel + j * SE_SZ;
+        if peek64(s3 + SE_MARK) == 0 {
+          if self.rsErrPkg == 0 as pchar {
+            self.rsErrPkg := peek64(s3 + SE_NAME) as pchar;
+          }
+        }
+        j := j + 1;
+      }
+      return RS_ERR_CYCLE;
+    }
+    return RS_OK;
+  }
+
+  // ---- Ergebnis ----
+
+  // Anzahl aufgeloester Pakete.
+  pub fn RsCount(): int64 { return self.rsOrderN; }
+
+  // Katalog-Index des n-ten Pakets in Installationsreihenfolge.
+  fn rsPvAt(n: int64): int64 {
+    if n < 0 { return 0 - 1; }
+    if n >= self.rsOrderN { return 0 - 1; }
+    var selIdx: int64 := peek64(self.rsOrder + n * 8);
+    return peek64(self.rsSel + selIdx * SE_SZ + SE_PV);
+  }
+
+  pub fn RsName(n: int64): pchar { return self.rsCat.DcName(self.rsPvAt(n)); }
+  pub fn RsVer(n: int64):  pchar { return self.rsCat.DcVer(self.rsPvAt(n)); }
+
+  // Schreibt das Ergebnis in ein LockFile (Installationsreihenfolge).
+  pub fn RsToLock(lock: LockFile): void {
+    var n: int64 := 0;
+    while n < self.rsOrderN {
+      var pv: int64 := self.rsPvAt(n);
+      lock.LfAddPkg(self.rsCat.DcName(pv), self.rsCat.DcVer(pv),
+                    self.rsCat.DcSha256(pv), self.rsCat.DcSource(pv));
+      n := n + 1;
+    }
+  }
+
+  // ---- Fehlerkontext ----
+
+  pub fn RsErrPkg(): pchar { return self.rsErrPkg; }
+  pub fn RsErrConsA(): pchar { return self.rsErrA; }
+  pub fn RsErrConsB(): pchar { return self.rsErrB; }
+
+  pub fn RsErrStr(code: int64): pchar {
+    if code == RS_ERR_MISSING  { return "Paket nicht in der Registry"c; }
+    if code == RS_ERR_CONFLICT { return "unvereinbare Versions-Constraints"c; }
+    if code == RS_ERR_CYCLE    { return "zyklische Abhaengigkeit"c; }
+    if code == RS_ERR_LIMIT    { return "zu viele Pakete oder Constraints"c; }
+    return "unbekannter Fehler"c;
+  }
+}
