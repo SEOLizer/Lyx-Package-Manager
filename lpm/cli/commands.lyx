@@ -99,6 +99,7 @@ fn lpmHelp(): void {
   cmdOutLn("  --verbose / -v         Ausführliche Ausgabe"c);
   cmdOutLn("  --offline              Kein Netzwerkzugriff (nur Cache)"c);
   cmdOutLn("  --registry=<url>       Alternative Registry-URL"c);
+  cmdOutLn("                         (Default: https://lpm.seolizer.de)"c);
   cmdOutLn("  --version / -V         Version ausgeben"c);
   cmdOutLn("  --help / -h            Diese Hilfe"c);
 }

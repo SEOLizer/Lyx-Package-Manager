@@ -28,6 +28,16 @@ fn arHasPrefix(s: pchar, prefix: pchar): bool {
 }
 
 // ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
+
+// Default registry used when --registry=URL is not given.
+// No trailing slash — callers append "/index.json", "/packages/..." themselves.
+pub fn arDefaultRegistry(): pchar {
+  return "https://lpm.seolizer.de"c;
+}
+
+// ---------------------------------------------------------------------------
 // LpmCtx — parsed CLI context
 // ---------------------------------------------------------------------------
 
@@ -64,6 +74,13 @@ pub type LpmCtx = class {
       }
       i := i + 1;
     }
+  }
+
+  // Returns the registry URL to use: --registry=URL if given, else the default.
+  pub fn LcRegistryUrl(): pchar {
+    if self.lcRegistry == 0 as pchar { return arDefaultRegistry(); }
+    if peek8(self.lcRegistry as int64) as int64 == 0 { return arDefaultRegistry(); }
+    return self.lcRegistry;
   }
 
   // Returns the subcommand string, or null if none given.

@@ -80,7 +80,7 @@ Globale Optionen:
 |------|---------|
 | `--verbose`, `-v` | Ausführliche Ausgabe |
 | `--offline` | Kein Netzwerkzugriff, nur Cache |
-| `--registry=<url>` | Alternative Registry verwenden |
+| `--registry=<url>` | Alternative Registry verwenden (Default: `https://lpm.seolizer.de`) |
 | `--version`, `-V` | Version ausgeben |
 | `--help`, `-h` | Hilfe anzeigen |
 
@@ -140,7 +140,7 @@ werden. Sie pinnt jede aufgelöste Version samt SHA256 des Archivs.
 name    = "net/http"
 version = "1.2.0"
 sha256  = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-source  = "https://registry.lyx-lang.org/packages/net/http/1.2.0.lxpkg"
+source  = "https://lpm.seolizer.de/packages/net/http/1.2.0.lxpkg"
 ```
 
 ### Paket-Archiv (`.lxpkg`)
