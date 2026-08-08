@@ -9,13 +9,14 @@
 @copyright("2026 Andreas Röne")
 unit lpm.cli.commands;
 
-import src.std.io;
-import src.std.fs;
+import std.io;
+import std.fs;
 import lpm.cli.args;
 import lpm.core.manifest;
 import lpm.core.lockfile;
 import lpm.core.dirent;
 import lpm.core.cache;
+import lpm.core.archive;
 
 // ---------------------------------------------------------------------------
 // Schreib-Hilfsfunktionen (via sys_write — kein io-Import nötig)
@@ -94,6 +95,7 @@ fn lpmHelp(): void {
   cmdOutLn("  resolve <pkg>          Import-Auflösung für lyxc (intern)"c);
   cmdOutLn("  cache list             Gecachte Pakete anzeigen"c);
   cmdOutLn("  cache clean            Cache leeren"c);
+  cmdOutLn("  cache add <f> <n> <v>  Lokales .lxpkg in den Cache entpacken"c);
   cmdOutLn(""c);
   cmdOutLn("Globale Optionen:"c);
   cmdOutLn("  --verbose / -v         Ausführliche Ausgabe"c);
@@ -175,6 +177,62 @@ fn lpmCacheClean(argc: int64, argv: pchar): int64 {
 }
 
 // ---------------------------------------------------------------------------
+// lpm cache add <archiv.lxpkg> <name> <version> [--sha256=<hex>]
+// Installiert ein lokal vorliegendes .lxpkg in den Cache. Damit ist der
+// Install-Pfad ohne Netzwerk testbar (Akzeptanzkriterium WP-PM-03).
+// ---------------------------------------------------------------------------
+
+fn lpmCacheAdd(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var archive: pchar := ctx.LcSubArg(1);
+  var name:    pchar := ctx.LcSubArg(2);
+  var version: pchar := ctx.LcSubArg(3);
+
+  if archive == 0 as pchar {
+    cmdErr("Verwendung: lpm cache add <archiv.lxpkg> <name> <version>"c);
+    return 1;
+  }
+  if name == 0 as pchar {
+    cmdErr("Verwendung: lpm cache add <archiv.lxpkg> <name> <version>"c);
+    return 1;
+  }
+  if version == 0 as pchar {
+    cmdErr("Verwendung: lpm cache add <archiv.lxpkg> <name> <version>"c);
+    return 1;
+  }
+  if FileExists(archive) == false {
+    cmdErr("Archiv nicht gefunden."c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  LpmCacheEnsure(home);
+  var dest: pchar := LpmCachePkgPath(home, name, version);
+
+  var expect: pchar := ctx.LcFlagVal("--sha256"c);
+  var rc: int64 := 0;
+  if expect == 0 as pchar {
+    rc := LpmUnpackLxpkg(archive, dest);
+  } else {
+    rc := LpmUnpackLxpkgVerified(archive, dest, expect);
+  }
+
+  if rc < 0 {
+    cmdErr(LpmArchiveErrStr(rc));
+    LpmCacheFreePath(dest);
+    return 1;
+  }
+
+  cmdOut("lpm: "c);
+  cmdOut(name);
+  cmdOut("@"c);
+  cmdOut(version);
+  cmdOut(" entpackt nach "c);
+  cmdOutLn(dest);
+  LpmCacheFreePath(dest);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Stubs für netzwerkabhängige Befehle
 // ---------------------------------------------------------------------------
 
@@ -213,8 +271,9 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
     if sub != 0 as pchar {
       if StrCmp(sub, "list"c)  == 0 { return lpmCacheList(argc, argv); }
       if StrCmp(sub, "clean"c) == 0 { return lpmCacheClean(argc, argv); }
+      if StrCmp(sub, "add"c)   == 0 { return lpmCacheAdd(ctx, argc, argv); }
     }
-    cmdOutLn("lpm cache: Subcommand erwartet: list | clean"c);
+    cmdOutLn("lpm cache: Subcommand erwartet: list | clean | add"c);
     return 1;
   }
 

@@ -1,0 +1,300 @@
+// lpm/core/archive.lyx
+// WP-PM-03 (Rest): .lxpkg-Entpacker.
+//
+// Ein .lxpkg ist ein zstd-komprimiertes tar-Archiv. Entpackt wird in zwei
+// Schritten, weil std.tar ueber einen Dateipfad arbeitet und keinen
+// Speicherpuffer annimmt: erst zstd -> temporaeres .tar im Zielverzeichnis,
+// dann tar -> Einzeldateien. Das Temporaerfile wird immer entfernt.
+//
+// Sicherheitsgrenzen dieses Layers:
+//   * LPA_TAR_MAX begrenzt die entpackte Groesse (Dekompressionsbombe).
+//   * lpaNameSafe verwirft absolute Pfade und jedes ".."-Segment, damit ein
+//     praepariertes Archiv nicht ausserhalb von destDir schreiben kann.
+//   * SHA256 wird gegen den erwarteten Hex-Wert geprueft, bevor entpackt wird.
+
+@description("lpm .lxpkg archive extraction (tar.zst)")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.archive;
+
+import std.io;
+import std.fs;
+import std.tar;
+import std.zstd;
+import std.crypto.sha256;
+
+pub con LPA_OK:        int64 := 0;
+pub con LPA_ERR_READ:  int64 := 0 - 1;   // .lxpkg nicht lesbar
+pub con LPA_ERR_ZSTD:  int64 := 0 - 2;   // zstd-Dekodierung fehlgeschlagen
+pub con LPA_ERR_LIMIT: int64 := 0 - 3;   // entpackt groesser als LPA_TAR_MAX
+pub con LPA_ERR_TAR:   int64 := 0 - 4;   // kein gueltiges tar
+pub con LPA_ERR_PATH:  int64 := 0 - 5;   // unsicherer Eintragsname im Archiv
+pub con LPA_ERR_WRITE: int64 := 0 - 6;   // Zieldatei nicht schreibbar
+pub con LPA_ERR_HASH:  int64 := 0 - 7;   // SHA256 stimmt nicht
+
+con LPA_TAR_START: int64 := 262144;      // 256 KiB erster Versuch
+con LPA_TAR_MAX:   int64 := 67108864;    // 64 MiB Obergrenze
+con LPA_PATH_MAX:  int64 := 4096;
+con LPA_DIR_MODE:  int64 := 493;         // 0755
+con LPA_TMP_NAME:  int64 := 0;           // Platzhalter, siehe lpaTmpTarPath
+
+// ---------------------------------------------------------------------------
+// Pfad-Hilfsfunktionen (eigene, um von Signaturen der fs-Helfer unabhaengig
+// zu bleiben — dieser Layer kennt nur NUL-terminierte Byte-Puffer)
+// ---------------------------------------------------------------------------
+
+// Schreibt "a/b" NUL-terminiert nach dst. Gibt die Laenge zurueck, oder -1
+// wenn das Ergebnis nicht in LPA_PATH_MAX passt.
+fn lpaJoin(dst: int64, a: pchar, b: int64): int64 {
+  var la: int64 := StrLen(a);
+  var lb: int64 := StrLen(b as pchar);
+  var need: int64 := la + 1 + lb + 1;
+  if need > LPA_PATH_MAX { return 0 - 1; }
+  memcpy(dst, a as int64, la);
+  var pos: int64 := la;
+  // Trennzeichen nur setzen, wenn a nicht schon auf '/' endet
+  if la > 0 {
+    if peek8(dst + la - 1) as int64 != 47 {
+      poke8(dst + pos, 47);
+      pos := pos + 1;
+    }
+  }
+  memcpy(dst + pos, b, lb);
+  pos := pos + lb;
+  poke8(dst + pos, 0);
+  return pos;
+}
+
+// Prueft einen Archiv-Eintragsnamen auf Pfad-Traversal.
+// Verworfen werden: leer, absolut ("/..."), sowie jedes Segment "..".
+fn lpaNameSafe(name: int64): bool {
+  if name == 0 { return false; }
+  var len: int64 := StrLen(name as pchar);
+  if len == 0 { return false; }
+  if peek8(name) as int64 == 47 { return false; }
+
+  // Segmentweise pruefen: ein Segment ist ".." wenn es genau zwei Punkte hat.
+  var segStart: int64 := 0;
+  var i: int64 := 0;
+  while i <= len {
+    var atEnd: bool := false;
+    if i == len { atEnd := true; }
+    var isSep: bool := false;
+    if atEnd == false {
+      if peek8(name + i) as int64 == 47 { isSep := true; }
+    }
+    if isSep || atEnd {
+      var segLen: int64 := i - segStart;
+      if segLen == 2 {
+        if peek8(name + segStart) as int64 == 46 {
+          if peek8(name + segStart + 1) as int64 == 46 { return false; }
+        }
+      }
+      segStart := i + 1;
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Legt alle Elternverzeichnisse von path an (path selbst bleibt Datei).
+fn lpaMkParents(path: int64): bool {
+  var len: int64 := StrLen(path as pchar);
+  // Ab 1, damit der fuehrende Slash eines absoluten Pfades nicht zu einem
+  // leeren Praefix ("" -> mkdir("")) fuehrt.
+  var i: int64 := 1;
+  while i < len {
+    if peek8(path + i) as int64 == 47 {
+      poke8(path + i, 0);
+      var exists: bool := IsDirectory(path as pchar);
+      if exists == false {
+        Mkdir(path as pchar, LPA_DIR_MODE);
+      }
+      poke8(path + i, 47);
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// SHA256
+// ---------------------------------------------------------------------------
+
+// Schreibt den SHA256 von path als 64 Hex-Zeichen + NUL nach outHex (65 Bytes).
+// Gibt false zurueck, wenn die Datei nicht gelesen werden konnte.
+pub fn LpaSha256File(path: pchar, outHex: int64): bool {
+  var fsize: int64 := FileSize(path);
+  if fsize < 0 { return false; }
+  var buf: int64 := alloc(fsize + 1);
+  var n: int64 := ReadFile(path, buf as pchar, fsize);
+  if n < 0 { free(buf, fsize + 1); return false; }
+  SHA256Hex(buf, n, outHex);
+  free(buf, fsize + 1);
+  return true;
+}
+
+// Vergleicht den SHA256 von path mit einem erwarteten Hex-String
+// (case-sensitiv, lowercase — so wird er in lyx.lock geschrieben).
+pub fn LpaSha256Equals(path: pchar, expectHex: pchar): bool {
+  if expectHex == 0 as pchar { return false; }
+  if StrLen(expectHex) != 64 { return false; }
+  var got: int64 := alloc(65);
+  var ok: bool := LpaSha256File(path, got);
+  if ok == false { free(got, 65); return false; }
+  var same: bool := true;
+  var i: int64 := 0;
+  while i < 64 {
+    if peek8(got + i) as int64 != peek8(expectHex as int64 + i) as int64 { same := false; }
+    i := i + 1;
+  }
+  free(got, 65);
+  return same;
+}
+
+// ---------------------------------------------------------------------------
+// zstd -> temporaeres tar
+// ---------------------------------------------------------------------------
+
+// Dekomprimiert srcPath nach tarPath. Die entpackte Groesse steht nicht im
+// Voraus fest, deshalb wird der Zielpuffer ab LPA_TAR_START verdoppelt, bis
+// die Dekodierung passt oder LPA_TAR_MAX erreicht ist.
+fn lpaZstdToTar(srcPath: pchar, tarPath: int64): int64 {
+  var fsize: int64 := FileSize(srcPath);
+  if fsize <= 0 { return LPA_ERR_READ; }
+
+  var src: int64 := alloc(fsize + 1);
+  var n: int64 := ReadFile(srcPath, src as pchar, fsize);
+  if n <= 0 { free(src, fsize + 1); return LPA_ERR_READ; }
+
+  var cap: int64 := LPA_TAR_START;
+  while cap <= LPA_TAR_MAX {
+    var dst: int64 := alloc(cap);
+    var out: int64 := ZstdDecompress(src, n, dst, cap);
+    if out > 0 {
+      var w: int64 := WriteFile(tarPath as pchar, dst as pchar, out);
+      free(dst, cap);
+      free(src, fsize + 1);
+      if w < 0 { return LPA_ERR_WRITE; }
+      return LPA_OK;
+    }
+    free(dst, cap);
+    if out != ZSTD_OVERFLOW {
+      free(src, fsize + 1);
+      return LPA_ERR_ZSTD;
+    }
+    cap := cap * 2;
+  }
+
+  free(src, fsize + 1);
+  return LPA_ERR_LIMIT;
+}
+
+// ---------------------------------------------------------------------------
+// tar -> Einzeldateien
+// ---------------------------------------------------------------------------
+
+// Entpackt alle regulaeren Dateien aus tarPath nach destDir.
+// Gibt die Anzahl geschriebener Dateien zurueck, oder einen LPA_ERR_*-Code.
+fn lpaTarExtract(tarPath: int64, destDir: pchar): int64 {
+  var h: int64 := TarOpen(tarPath);
+  if h == 0 { return LPA_ERR_TAR; }
+
+  var count: int64 := TarCount(h);
+  var written: int64 := 0;
+  var status: int64 := LPA_OK;
+  var outPath: int64 := alloc(LPA_PATH_MAX);
+
+  var i: int64 := 0;
+  while i < count {
+    if status == LPA_OK {
+      var name: int64 := TarName(h, i);
+      var safe: bool := lpaNameSafe(name);
+      if safe == false {
+        status := LPA_ERR_PATH;
+      } else {
+        var plen: int64 := lpaJoin(outPath, destDir, name);
+        if plen < 0 {
+          status := LPA_ERR_PATH;
+        } else {
+          lpaMkParents(outPath);
+          var size: int64 := TarSize(h, i);
+          var data: int64 := alloc(size + 1);
+          var got: int64 := TarRead(h, i, data, size);
+          if got < 0 {
+            status := LPA_ERR_TAR;
+          } else {
+            var w: int64 := WriteFile(outPath as pchar, data as pchar, got);
+            if w < 0 { status := LPA_ERR_WRITE; } else { written := written + 1; }
+          }
+          free(data, size + 1);
+        }
+      }
+    }
+    i := i + 1;
+  }
+
+  free(outPath, LPA_PATH_MAX);
+  TarClose(h);
+  if status != LPA_OK { return status; }
+  return written;
+}
+
+// ---------------------------------------------------------------------------
+// Oeffentliche API
+// ---------------------------------------------------------------------------
+
+// Entpackt lxpkgPath nach destDir. destDir wird angelegt, falls noetig.
+// Gibt die Anzahl entpackter Dateien zurueck, oder einen LPA_ERR_*-Code.
+//
+// Das temporaere .tar liegt im Zielverzeichnis (nicht in /tmp), damit
+// Entpacken und Zieldateien immer auf demselben Dateisystem landen.
+pub fn LpmUnpackLxpkg(lxpkgPath: pchar, destDir: pchar): int64 {
+  var exists: bool := IsDirectory(destDir);
+  if exists == false {
+    var tmpDir: int64 := alloc(LPA_PATH_MAX);
+    var dl: int64 := StrLen(destDir);
+    if dl + 1 > LPA_PATH_MAX { free(tmpDir, LPA_PATH_MAX); return LPA_ERR_PATH; }
+    memcpy(tmpDir, destDir as int64, dl);
+    poke8(tmpDir + dl, 0);
+    lpaMkParents(tmpDir);
+    Mkdir(destDir, LPA_DIR_MODE);
+    free(tmpDir, LPA_PATH_MAX);
+  }
+
+  var tarPath: int64 := alloc(LPA_PATH_MAX);
+  var tl: int64 := lpaJoin(tarPath, destDir, ".lpm-unpack.tar"c as int64);
+  if tl < 0 { free(tarPath, LPA_PATH_MAX); return LPA_ERR_PATH; }
+
+  var rc: int64 := lpaZstdToTar(lxpkgPath, tarPath);
+  if rc != LPA_OK {
+    DeleteFile(tarPath as pchar);
+    free(tarPath, LPA_PATH_MAX);
+    return rc;
+  }
+
+  var res: int64 := lpaTarExtract(tarPath, destDir);
+  DeleteFile(tarPath as pchar);
+  free(tarPath, LPA_PATH_MAX);
+  return res;
+}
+
+// Wie LpmUnpackLxpkg, prueft aber zuerst den SHA256 des Archivs.
+// Der erwartete Wert kommt aus lyx.lock bzw. dem Registry-Index.
+pub fn LpmUnpackLxpkgVerified(lxpkgPath: pchar, destDir: pchar, sha256Hex: pchar): int64 {
+  var ok: bool := LpaSha256Equals(lxpkgPath, sha256Hex);
+  if ok == false { return LPA_ERR_HASH; }
+  return LpmUnpackLxpkg(lxpkgPath, destDir);
+}
+
+// Klartext zu einem LPA_ERR_*-Code (fuer Fehlermeldungen der CLI).
+pub fn LpmArchiveErrStr(code: int64): pchar {
+  if code == LPA_ERR_READ  { return "Archiv nicht lesbar"c; }
+  if code == LPA_ERR_ZSTD  { return "zstd-Dekodierung fehlgeschlagen"c; }
+  if code == LPA_ERR_LIMIT { return "Archiv entpackt zu gross (Limit 64 MiB)"c; }
+  if code == LPA_ERR_TAR   { return "kein gueltiges tar-Archiv"c; }
+  if code == LPA_ERR_PATH  { return "unsicherer Pfad im Archiv"c; }
+  if code == LPA_ERR_WRITE { return "Schreiben fehlgeschlagen"c; }
+  if code == LPA_ERR_HASH  { return "SHA256 stimmt nicht"c; }
+  return "unbekannter Fehler"c;
+}

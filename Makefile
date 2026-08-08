@@ -8,6 +8,7 @@ SRCS := main.lyx \
         lpm/core/lockfile.lyx \
         lpm/core/dirent.lyx \
         lpm/core/cache.lyx \
+        lpm/core/archive.lyx \
         lpm/cli/args.lyx \
         lpm/cli/commands.lyx
 

@@ -6,9 +6,14 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 
 `lpm` ist selbst vollständig in Lyx geschrieben und wird mit `lyxc` übersetzt.
 
-> **Status: frühe Entwicklung (v0.1.0).** Funktionsfähig sind `init`, `cache list`
-> und `cache clean`. Alle netzwerkabhängigen Befehle sind noch Stubs — siehe
-> [Roadmap](#roadmap).
+> **Status: frühe Entwicklung (v0.1.0).** Funktionsfähig sind `init`, `cache list`,
+> `cache clean` und `cache add` (lokales `.lxpkg` entpacken). Alle netzwerk-
+> abhängigen Befehle sind noch Stubs — siehe [Roadmap](#roadmap).
+>
+> **Achtung:** `cache add` und jedes Anlegen von `~/.lpm/` sind derzeit durch einen
+> Compiler-Bug blockiert — der seccomp-Filter von `lyxc` lässt `mkdir`, `unlink`
+> und `rename` nicht durch ([LyX-Compiler#1185](https://github.com/SEOLizer/LyX-Compiler/issues/1185)).
+> Siehe [Bekannte Fallstricke](#bekannte-fallstricke).
 
 ---
 
@@ -64,6 +69,7 @@ lpm <subcommand> [optionen]
 | `lpm init [--name=<name>]` | Neues Paket anlegen (erstellt `lyx.toml`) | ✅ |
 | `lpm cache list` | Gecachte Pakete anzeigen | ✅ |
 | `lpm cache clean` | Lokalen Cache leeren | ✅ |
+| `lpm cache add <f> <n> <v>` | Lokales `.lxpkg` in den Cache entpacken | ⚠️ |
 | `lpm install [<pkg>]` | Paket bzw. alle Dependencies installieren | ⬜ |
 | `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen | ⬜ |
 | `lpm update [<pkg>]` | Paket(e) aktualisieren | ⬜ |
@@ -191,7 +197,21 @@ lyx-lpm/
       lockfile.lyx         lyx.lock lesen und schreiben
       dirent.lyx           Verzeichnis-Listing mit Index-Zugriff
       cache.lyx            Lokaler Paket-Cache unter ~/.lpm/
+      archive.lyx          .lxpkg entpacken (zstd + tar), SHA256-Pruefung
 ```
+
+### Warum der `std.*`-Baum
+
+`aurum` hat zwei Unit-Bäume: `src.std.*` (11 Units) und `std.*` (deutlich größer).
+Sie exportieren dieselben Namen und lassen sich nicht gemeinsam importieren —
+schon `import src.std.io` neben `import std.zstd` scheitert mit „mehrdeutiges
+Symbol" für `alloc`, `StrCmp`, `PrintIntLn` und rund ein Dutzend weitere.
+
+`lpm` startete auf `src.std.*`, ist aber auf `std.*` portiert, weil dort alles
+liegt, was der Paketmanager braucht: `std.tar`, `std.zstd`, `std.crypto.sha256`,
+`std.net.https`. Der Umbau kostete das Umbiegen der Imports plus zwei Stellen
+(`FileOpen`/`FileRead`/`FileClose` → `ReadFile`); `StrLen` und `ArgvGet` sind
+Compiler-Intrinsics und in beiden Bäumen verfügbar.
 
 ### Warum ein eigenes `dirent.lyx`?
 
@@ -221,8 +241,11 @@ Der ausführliche Fahrplan liegt im `aurum`-Repository unter
 | M5 Enterprise | PM-11 | Monorepo-/Workspace-Support | ⬜ |
 
 **Aktueller Stand:** PM-01 (SemVer, Manifest, Lock-File) und PM-02
-(CLI-Grundstruktur) sind abgeschlossen. PM-03 ist bis auf den
-`.lxpkg`-Entpacker (tar.zst) fertig.
+(CLI-Grundstruktur) sind abgeschlossen. PM-03 ist inhaltlich fertig — der
+`.lxpkg`-Entpacker liegt in `lpm/core/archive.lyx` und ist end-to-end getestet
+(Entpacken, SHA256-Prüfung, Abwehr von Pfad-Traversal). Das Akzeptanzkriterium
+gilt trotzdem noch nicht als erfüllt, weil das Binary mit aktivem seccomp keine
+Verzeichnisse anlegen kann (LyX-Compiler#1185).
 
 Ursprünglich war eine Go-Implementierung für V1 mit späterem Port nach Lyx
 vorgesehen. Das Self-Hosting wurde vorgezogen — `lpm` ist von Beginn an in Lyx
@@ -261,6 +284,19 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
 
 ### Bekannte Fallstricke
 
+- **seccomp blockiert `mkdir`, `unlink` und `rename`** trotz gewährter
+  Capabilities `fs.create`/`fs.delete`
+  ([LyX-Compiler#1185](https://github.com/SEOLizer/LyX-Compiler/issues/1185)).
+  Betroffen ist jeder Pfad, der Verzeichnisse anlegt oder Dateien löscht — also
+  `cache add` und später `install`. Zum Testen hilft ein Compat-Build, der die
+  Durchsetzung abschaltet:
+
+  ```bash
+  lyxc --capabilities=compat main.lyx -I . -I /pfad/zu/aurum -o /tmp/lpm-compat
+  ```
+
+  Für Releases ist das keine Option: ein Paketmanager, der fremde Archive
+  entpackt, soll seccomp und landlock gerade nicht abschalten.
 - **`&&` schließt in `lyxc` nicht kurz.** `if p != null && deref(p)` wertet
   beide Seiten aus und segfaultet bei Nullzeigern. Null-Checks müssen
   geschachtelt werden.

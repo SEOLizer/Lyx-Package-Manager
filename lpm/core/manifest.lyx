@@ -8,8 +8,8 @@
 @copyright("2026 Andreas Röne")
 unit lpm.core.manifest;
 
-import src.std.io;
-import src.std.fs;
+import std.io;
+import std.fs;
 
 // ---------------------------------------------------------------------------
 // Konstanten
@@ -270,10 +270,7 @@ pub type Manifest = class {
   // Read and parse lyx.toml at path. Returns true on success.
   pub fn MfRead(path: pchar): bool {
     var buf: int64 := alloc(MF_BUF_SZ + 1);
-    var fd: int64 := FileOpen(path, 0, 0);
-    if fd < 0 { free(buf, MF_BUF_SZ + 1); return false; }
-    var nread: int64 := FileRead(fd, buf, MF_BUF_SZ);
-    FileClose(fd);
+    var nread: int64 := ReadFile(path, buf as pchar, MF_BUF_SZ);
     if nread <= 0 { free(buf, MF_BUF_SZ + 1); return false; }
     poke8(buf + nread, 0);
 

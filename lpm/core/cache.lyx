@@ -18,8 +18,8 @@
 @copyright("2026 Andreas Röne")
 unit lpm.core.cache;
 
-import src.std.io;
-import src.std.fs;
+import std.io;
+import std.fs;
 import lpm.core.dirent;
 
 con LPC_PATH_MAX: int64 := 4096;

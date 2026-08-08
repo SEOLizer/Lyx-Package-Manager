@@ -7,8 +7,8 @@
 @copyright("2026 Andreas Röne")
 unit lpm.core.lockfile;
 
-import src.std.io;
-import src.std.fs;
+import std.io;
+import std.fs;
 
 // ---------------------------------------------------------------------------
 // Konstanten
@@ -190,10 +190,7 @@ pub type LockFile = class {
   // Read lyx.lock at path. Returns true on success.
   pub fn LfRead(path: pchar): bool {
     var buf: int64 := alloc(LF_BUF_SZ + 1);
-    var fd: int64 := FileOpen(path, 0, 0);
-    if fd < 0 { free(buf, LF_BUF_SZ + 1); return false; }
-    var nread: int64 := FileRead(fd, buf, LF_BUF_SZ);
-    FileClose(fd);
+    var nread: int64 := ReadFile(path, buf as pchar, LF_BUF_SZ);
     if nread <= 0 { free(buf, LF_BUF_SZ + 1); return false; }
     poke8(buf + nread, 0);
 

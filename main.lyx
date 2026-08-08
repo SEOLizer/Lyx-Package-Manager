@@ -7,7 +7,7 @@
 @capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit])
 unit main;
 
-import src.std.io grant [fs.read, fs.write];
+import std.io grant [fs.read, fs.write];
 import lpm.cli.commands grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit];
 
 pub fn main(argc: int64, argv: pchar): int64 {
