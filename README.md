@@ -334,9 +334,21 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
   und `TmpFile` brauchen — die Referenz allein genügt aber. `lpm` ist deshalb
   seit `lyxc` 1.0.13J nicht mehr statisch (193 KB → 240 KB), verliert RELRO und
   landet bei 40/45 statt 45/45.
-- **HTTPS ist weiterhin nicht nutzbar.** Der `getpid`-Block ist mit 1.0.13J weg,
-  der Verbindungsaufbau über `std.net.https` hängt aber (Timeout ohne Antwort).
-  Ursache noch nicht eingegrenzt.
+- **HTTPS ist weiterhin nicht nutzbar** — aus zwei voneinander unabhängigen
+  Gründen, beide eingegrenzt und gemeldet:
+  - [#1192](https://github.com/SEOLizer/LyX-Compiler/issues/1192): `sys_sendto`
+    und `sys_recvfrom` bekommen im 4. Argument (`flags`) Müll statt `0`, sobald
+    sie aus einer Wrapper-Funktion aufgerufen werden. Damit scheitert jede
+    Namensauflösung über `std.net.dns`. Der Müllwert wechselt pro Lauf — mit
+    `MSG_DONTWAIT` gibt es sofort einen Fehler, ohne blockiert der Aufruf bis
+    zum Timeout. Das erklärt, warum das Symptom mal Hänger, mal Fehler war.
+  - [#1193](https://github.com/SEOLizer/LyX-Compiler/issues/1193): `setsockopt`
+    (54) fehlt im seccomp-Filter von `network.tcp.connect`. Mit fester IP kommt
+    der Verbindungsaufbau bis `TLSConnect` und stirbt dort, weil OpenSSL
+    `TCP_ULP` setzt.
+
+  Zwischenstand mit umgangenem DNS: TCP-Connect ✅, `TLSInit` ✅,
+  `TLSConnect` ✗.
 - **`chmod` braucht seit `lyxc` 1.0.13J die Capability `fs.perm`** — ohne sie
   SIGSYS. `lpm` benutzt es nicht, aber die Regel gilt für jeden Konsumenten.
 - **`&&` schließt in `lyxc` nicht kurz.** `if p != null && deref(p)` wertet
