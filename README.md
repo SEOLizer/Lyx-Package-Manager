@@ -7,13 +7,12 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 `lpm` ist selbst vollständig in Lyx geschrieben und wird mit `lyxc` übersetzt.
 
 > **Status: frühe Entwicklung (v0.1.0).** Funktionsfähig sind `init`, `cache list`,
-> `cache clean` und `cache add` (lokales `.lxpkg` entpacken). Alle netzwerk-
-> abhängigen Befehle sind noch Stubs — siehe [Roadmap](#roadmap).
+> `cache clean`, `cache add` (lokales `.lxpkg` entpacken) sowie `install`,
+> `remove` und `list` gegen lokale Katalog-Quellen. Es fehlt der Download: der
+> HTTPS-Transport zur Registry ist noch nicht angebunden — siehe
+> [Roadmap](#roadmap).
 >
-> **Achtung:** `cache add` und jedes Anlegen von `~/.lpm/` sind derzeit durch einen
-> Compiler-Bug blockiert — der seccomp-Filter von `lyxc` lässt `mkdir`, `unlink`
-> und `rename` nicht durch ([LyX-Compiler#1185](https://github.com/SEOLizer/LyX-Compiler/issues/1185)).
-> Siehe [Bekannte Fallstricke](#bekannte-fallstricke).
+> Benötigt `lyxc` ≥ 1.0.13J.
 
 ---
 
@@ -69,8 +68,8 @@ lpm <subcommand> [optionen]
 | `lpm init [--name=<name>]` | Neues Paket anlegen (erstellt `lyx.toml`) | ✅ |
 | `lpm cache list` | Gecachte Pakete anzeigen | ✅ |
 | `lpm cache clean` | Lokalen Cache leeren | ✅ |
-| `lpm cache add <f> <n> <v>` | Lokales `.lxpkg` in den Cache entpacken | ⚠️ |
-| `lpm install [<pkg[@ver]>]` | Auflösen und `lyx.lock` schreiben | ⚠️ |
+| `lpm cache add <f> <n> <v>` | Lokales `.lxpkg` in den Cache entpacken | ✅ |
+| `lpm install [<pkg[@ver]>]` | Auflösen und `lyx.lock` schreiben (ohne Download) | ⚠️ |
 | `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen, Lock neu schreiben | ✅ |
 | `lpm update [<pkg>]` | Paket(e) aktualisieren | ⬜ |
 | `lpm search <query>` | Registry durchsuchen | ⬜ |
@@ -253,18 +252,19 @@ Der ausführliche Fahrplan liegt im `aurum`-Repository unter
 
 | Meilenstein | Work Packages | Ergebnis | Status |
 |-------------|---------------|----------|--------|
-| M1 Offline-Grundlage | PM-01 – PM-03 | `init`, `cache`, lokale Pakete | 🟡 in Arbeit |
+| M1 Offline-Grundlage | PM-01 – PM-03 | `init`, `cache`, lokale Pakete | ✅ |
 | M2 Install-Flow | PM-04 – PM-06 | `install` gegen Registry | 🟡 in Arbeit |
 | M3 Compiler-Integration | PM-07 | `lyxc` löst Imports automatisch auf | ⬜ |
 | M4 Ökosystem-Launch | PM-08 – PM-10 | `publish` + öffentliche Registry | ⬜ |
 | M5 Enterprise | PM-11 | Monorepo-/Workspace-Support | ⬜ |
 
 **Aktueller Stand:** PM-01 (SemVer, Manifest, Lock-File) und PM-02
-(CLI-Grundstruktur) sind abgeschlossen. PM-03 ist inhaltlich fertig — der
-`.lxpkg`-Entpacker liegt in `lpm/core/archive.lyx` und ist end-to-end getestet
-(Entpacken, SHA256-Prüfung, Abwehr von Pfad-Traversal). Das Akzeptanzkriterium
-gilt trotzdem noch nicht als erfüllt, weil das Binary mit aktivem seccomp keine
-Verzeichnisse anlegen kann (LyX-Compiler#1185).
+(CLI-Grundstruktur) sind abgeschlossen. PM-03 ist abgeschlossen — der `.lxpkg`-Entpacker liegt in
+`lpm/core/archive.lyx` und ist mit aktivem seccomp end-to-end verifiziert:
+entpacken, SHA256-Prüfung, Abwehr von Pfad-Traversal, danach `install` gegen
+das gecachte Paket. Damit ist **M1 vollständig**. Möglich wurde das durch den
+Fix zu [LyX-Compiler#1185](https://github.com/SEOLizer/LyX-Compiler/issues/1185)
+in `lyxc` 1.0.13J.
 
 PM-04 (Resolver) ist implementiert und getestet: `lpm/core/resolver.lyx` löst
 transitive Abhängigkeiten auf, wählt je Paket die höchste Version, die *alle*
@@ -328,24 +328,17 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
 
 ### Bekannte Fallstricke
 
-- **seccomp blockiert `mkdir`, `unlink` und `rename`** trotz gewährter
-  Capabilities `fs.create`/`fs.delete`
-  ([LyX-Compiler#1185](https://github.com/SEOLizer/LyX-Compiler/issues/1185)).
-  Betroffen ist jeder Pfad, der Verzeichnisse anlegt oder Dateien löscht — also
-  `cache add` und später `install`. Zum Testen hilft ein Compat-Build, der die
-  Durchsetzung abschaltet:
-
-  ```bash
-  lyxc --capabilities=compat main.lyx -I . -I /pfad/zu/aurum -o /tmp/lpm-compat
-  ```
-
-  Für Releases ist das keine Option: ein Paketmanager, der fremde Archive
-  entpackt, soll seccomp und landlock gerade nicht abschalten.
-- **HTTPS ist mit aktivem LCBS derzeit gar nicht nutzbar** (gleiches Issue):
-  `std.net.https` linkt gegen OpenSSL, und OpenSSL ruft beim Init `getpid` —
-  das steht ebenfalls nicht im Filter, der Prozess stirbt vor dem
-  Verbindungsaufbau. Nebenwirkung: sobald `std.net.tls` importiert wird, ist das
-  Binary nicht mehr statisch gelinkt.
+- **`std.fs` macht das Binary dynamisch gelinkt**
+  ([LyX-Compiler#1191](https://github.com/SEOLizer/LyX-Compiler/issues/1191)):
+  die Unit enthält ein `extern fn time(...) link "libc.so.6"`, das nur `MkTemp`
+  und `TmpFile` brauchen — die Referenz allein genügt aber. `lpm` ist deshalb
+  seit `lyxc` 1.0.13J nicht mehr statisch (193 KB → 240 KB), verliert RELRO und
+  landet bei 40/45 statt 45/45.
+- **HTTPS ist weiterhin nicht nutzbar.** Der `getpid`-Block ist mit 1.0.13J weg,
+  der Verbindungsaufbau über `std.net.https` hängt aber (Timeout ohne Antwort).
+  Ursache noch nicht eingegrenzt.
+- **`chmod` braucht seit `lyxc` 1.0.13J die Capability `fs.perm`** — ohne sie
+  SIGSYS. `lpm` benutzt es nicht, aber die Regel gilt für jeden Konsumenten.
 - **`&&` schließt in `lyxc` nicht kurz.** `if p != null && deref(p)` wertet
   beide Seiten aus und segfaultet bei Nullzeigern. Null-Checks müssen
   geschachtelt werden.
