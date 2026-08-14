@@ -1,0 +1,356 @@
+// lpm/core/fetch.lyx
+// WP-PM-05 (Teil 2): HTTPS-Transport zur Registry.
+//
+// Aufgabe dieses Moduls ist ausschliesslich der Transport: eine URL aus der
+// Registry holen und das Ergebnis in den lokalen Spiegel unter
+// ~/.lpm/registry/ schreiben. Geparst wird danach weiterhin von
+// lpm.core.localcat / lpm.core.index aus dem Spiegel — der Resolver sieht
+// keinen Unterschied zwischen "heruntergeladen" und "war schon da".
+//
+// Diese Trennung ist Absicht: --offline heisst schlicht, dass dieses Modul
+// nicht aufgerufen wird, und ein abgebrochener Download kann keinen halb
+// geparsten Katalog hinterlassen.
+//
+// CAPABILITIES: std.net.https zieht network.tcp.connect, network.udp.connect
+// (die Namensaufloesung laeuft ueber UDP — fehlt sie, stirbt der Prozess ohne
+// Meldung an SIGSYS), memory.mmap sowie fs.read und fs.meta nach sich. fs.meta
+// braucht OpenSSL, um den CA-Store unter /usr/lib/ssl/certs abzuklappern.
+//
+// Registry-Protokoll siehe docs/registry.md.
+
+@description("lpm registry HTTPS transport")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.fetch;
+
+import std.io;
+import std.fs;
+import std.net.https;
+import lpm.core.cache;
+
+pub con FT_OK:        int64 := 0;
+pub con FT_ERR_URL:   int64 := 0 - 1;   // Registry-URL nicht verwertbar
+pub con FT_ERR_NET:   int64 := 0 - 2;   // kein Ergebnis vom Server
+pub con FT_ERR_404:   int64 := 0 - 3;   // Paket bzw. Index existiert nicht
+pub con FT_ERR_HTTP:  int64 := 0 - 4;   // anderer 4xx/5xx-Status
+pub con FT_ERR_LIMIT: int64 := 0 - 5;   // Antwort groesser als FT_BODY_MAX
+pub con FT_ERR_WRITE: int64 := 0 - 6;   // Spiegel liess sich nicht schreiben
+
+con FT_PATH_MAX: int64 := 4096;
+con FT_HOST_MAX: int64 := 256;
+con FT_BODY_MAX: int64 := 4194304;   // 4 MiB — ein Index, kein Archiv
+con FT_DIR_MODE: int64 := 493;       // 0755
+
+// ---------------------------------------------------------------------------
+// Pfad-Helfer (bewusst dieselbe Form wie in cache.lyx und localcat.lyx)
+// ---------------------------------------------------------------------------
+
+fn ftAppend(buf: int64, pos: int64, s: pchar): int64 {
+  if s == 0 as pchar { return pos; }
+  var slen: int64 := StrLen(s);
+  memcpy(buf + pos, s as int64, slen);
+  return pos + slen;
+}
+
+fn ftEnd(buf: int64, pos: int64): void {
+  poke8(buf + pos, 0);
+}
+
+// ---------------------------------------------------------------------------
+// URL-Zerlegung
+// ---------------------------------------------------------------------------
+//
+// Erwartet wird die Form aus arDefaultRegistry(): "https://host" mit optionalem
+// Basispfad, ohne abschliessenden Slash. http:// wird abgelehnt statt still auf
+// TLS hochgestuft — eine Registry ohne TLS soll auffallen, nicht durchrutschen.
+
+// Schreibt den Host aus url nach hostBuf (max FT_HOST_MAX inkl. Terminator).
+// Rueckgabe: Offset des Basispfads in url, oder -1 wenn die URL nicht passt.
+fn ftSplitUrl(url: pchar, hostBuf: int64): int64 {
+  if url == 0 as pchar { return 0 - 1; }
+  var u: int64 := url as int64;
+  var n: int64 := StrLen(url);
+
+  // Schema pruefen: nur https://
+  var pre: pchar := "https://"c;
+  var plen: int64 := StrLen(pre);
+  if n <= plen { return 0 - 1; }
+  var i: int64 := 0;
+  while i < plen {
+    if peek8(u + i) as int64 != peek8(pre as int64 + i) as int64 { return 0 - 1; }
+    i := i + 1;
+  }
+
+  // Host laeuft bis zum naechsten '/' oder bis zum Ende.
+  var h: int64 := 0;
+  var p: int64 := plen;
+  while p < n {
+    var c: int64 := peek8(u + p) as int64;
+    if c == 47 { break; }
+    if h >= FT_HOST_MAX - 1 { return 0 - 1; }
+    poke8(hostBuf + h, c as int8);
+    h := h + 1;
+    p := p + 1;
+  }
+  poke8(hostBuf + h, 0);
+  if h == 0 { return 0 - 1; }
+
+  // Ein Port im Host wird nicht unterstuetzt: HTTPSGet verbindet fest auf 443.
+  i := 0;
+  while i < h {
+    if peek8(hostBuf + i) as int64 == 58 { return 0 - 1; }
+    i := i + 1;
+  }
+
+  return p;
+}
+
+// Ist registry eine verwertbare Registry-URL? Wird vor jedem Dateisystem- und
+// Netzzugriff geprueft, damit eine falsche --registry-Angabe nicht erst nach
+// dem Anlegen von ~/.lpm auffaellt.
+fn ftUrlOk(registry: pchar): bool {
+  var host: int64 := alloc(FT_HOST_MAX);
+  var off: int64 := ftSplitUrl(registry, host);
+  free(host, FT_HOST_MAX);
+  return off >= 0;
+}
+
+// ---------------------------------------------------------------------------
+// Transport
+// ---------------------------------------------------------------------------
+
+// Holt https://<host><path> und legt den Rumpf in einem frisch allozierten,
+// nullterminierten Puffer ab. *outBuf/*outLen sind Zeiger auf int64-Slots.
+// Rueckgabe: FT_OK oder ein FT_ERR_*-Code. Bei allem ausser FT_OK bleibt
+// *outBuf 0.
+fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64): int64 {
+  poke64(outBuf, 0);
+  poke64(outLen, 0);
+
+  var resp: HTTPResponse := HTTPSGet(host as int64, path as int64);
+
+  if resp.statusCode == 0 {
+    HTTPResponseFree(resp);
+    return FT_ERR_NET;
+  }
+  if resp.statusCode == 404 {
+    HTTPResponseFree(resp);
+    return FT_ERR_404;
+  }
+  if resp.statusCode != 200 {
+    HTTPResponseFree(resp);
+    return FT_ERR_HTTP;
+  }
+  if resp.bodySize <= 0 {
+    HTTPResponseFree(resp);
+    return FT_ERR_NET;
+  }
+  if resp.bodySize > FT_BODY_MAX {
+    HTTPResponseFree(resp);
+    return FT_ERR_LIMIT;
+  }
+
+  // Umkopieren, damit der Aufrufer nicht am mmap-Puffer der Response haengt
+  // und HTTPResponseFree sofort laufen kann.
+  var size: int64 := resp.bodySize;
+  var buf: int64 := alloc(size + 1);
+  memcpy(buf, resp.bodyPtr, size);
+  poke8(buf + size, 0);
+  HTTPResponseFree(resp);
+
+  poke64(outBuf, buf);
+  poke64(outLen, size);
+  return FT_OK;
+}
+
+// Gibt einen von ftGet gelieferten Puffer frei.
+pub fn FtFreeBody(buf: int64, len: int64): void {
+  if buf != 0 { free(buf, len + 1); }
+}
+
+// ---------------------------------------------------------------------------
+// Spiegel schreiben
+// ---------------------------------------------------------------------------
+
+// Legt alle Verzeichnisse bis zum letzten '/' in path an.
+// Rueckgabe: true wenn das Elternverzeichnis danach existiert.
+fn ftMkdirParents(path: int64): bool {
+  var n: int64 := StrLen(path as pchar);
+  var i: int64 := 0;
+  // Ab 1 beginnen: ein fuehrender Slash ist die Wurzel, die legt niemand an.
+  i := 1;
+  while i < n {
+    if peek8(path + i) as int64 == 47 {
+      poke8(path + i, 0);
+      if !IsDirectory(path as pchar) { Mkdir(path as pchar, FT_DIR_MODE); }
+      var ok: bool := IsDirectory(path as pchar);
+      poke8(path + i, 47 as int8);
+      if !ok { return false; }
+    }
+    i := i + 1;
+  }
+  return true;
+}
+
+// Schreibt len Bytes aus buf nach path und legt fehlende Verzeichnisse an.
+// Geschrieben wird ueber eine .tmp-Datei und Rename, damit ein Abbruch keinen
+// halben Index im Spiegel hinterlaesst — genau den wuerde der Parser beim
+// naechsten Lauf als Syntaxfehler melden.
+fn ftWriteAtomic(path: int64, buf: int64, len: int64): bool {
+  if !ftMkdirParents(path) { return false; }
+
+  var tmp: int64 := alloc(FT_PATH_MAX);
+  var p: int64 := 0;
+  p := ftAppend(tmp, p, path as pchar);
+  p := ftAppend(tmp, p, ".tmp"c);
+  ftEnd(tmp, p);
+
+  var wrote: int64 := WriteFile(tmp as pchar, buf as pchar, len);
+  if wrote != len {
+    DeleteFile(tmp as pchar);
+    free(tmp, FT_PATH_MAX);
+    return false;
+  }
+
+  var ok: bool := Rename(tmp as pchar, path as pchar);
+  if !ok { DeleteFile(tmp as pchar); }
+  free(tmp, FT_PATH_MAX);
+  return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Registry-Operationen
+// ---------------------------------------------------------------------------
+
+// Holt <registry><basePath><relPath> und spiegelt das Ergebnis nach
+// <regDir><relPath>.
+fn ftMirror(registry: pchar, regDir: pchar, relPath: pchar): int64 {
+  var host: int64 := alloc(FT_HOST_MAX);
+  var baseOff: int64 := ftSplitUrl(registry, host);
+  if baseOff < 0 {
+    free(host, FT_HOST_MAX);
+    return FT_ERR_URL;
+  }
+
+  // Anfragepfad = Basispfad der Registry-URL + relPath.
+  var req: int64 := alloc(FT_PATH_MAX);
+  var p: int64 := 0;
+  p := ftAppend(req, p, (registry as int64 + baseOff) as pchar);
+  p := ftAppend(req, p, relPath);
+  ftEnd(req, p);
+
+  var bodySlot: int64 := alloc(16);
+  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8);
+  free(req, FT_PATH_MAX);
+  free(host, FT_HOST_MAX);
+
+  if rc != FT_OK {
+    free(bodySlot, 16);
+    return rc;
+  }
+
+  var body: int64 := peek64(bodySlot);
+  var len: int64 := peek64(bodySlot + 8);
+  free(bodySlot, 16);
+
+  var dst: int64 := alloc(FT_PATH_MAX);
+  p := 0;
+  p := ftAppend(dst, p, regDir);
+  p := ftAppend(dst, p, relPath);
+  ftEnd(dst, p);
+
+  var ok: bool := ftWriteAtomic(dst, body, len);
+  free(dst, FT_PATH_MAX);
+  FtFreeBody(body, len);
+
+  if !ok { return FT_ERR_WRITE; }
+  return FT_OK;
+}
+
+// Spiegelt /packages/<name>/index.json.
+// Der Paketname geht unveraendert in den Pfad (siehe docs/registry.md); dass er
+// keine Traversal-Segmente enthaelt, garantiert FtNameIsSafe.
+pub fn FtSyncPackageIndex(home: pchar, registry: pchar, name: pchar): int64 {
+  if !FtNameIsSafe(name) { return FT_ERR_URL; }
+  if !ftUrlOk(registry) { return FT_ERR_URL; }
+  if !LpmCacheEnsure(home) { return FT_ERR_WRITE; }
+
+  var rel: int64 := alloc(FT_PATH_MAX);
+  var p: int64 := 0;
+  p := ftAppend(rel, p, "/packages/"c);
+  p := ftAppend(rel, p, name);
+  p := ftAppend(rel, p, "/index.json"c);
+  ftEnd(rel, p);
+
+  var regDir: pchar := LpmCacheRegistryDir(home);
+  var rc: int64 := ftMirror(registry, regDir, rel as pchar);
+  LpmCacheFreePath(regDir);
+  free(rel, FT_PATH_MAX);
+  return rc;
+}
+
+// Spiegelt /index.json (Gesamtindex fuer `lpm search`).
+pub fn FtSyncRootIndex(home: pchar, registry: pchar): int64 {
+  if !ftUrlOk(registry) { return FT_ERR_URL; }
+  if !LpmCacheEnsure(home) { return FT_ERR_WRITE; }
+
+  var regDir: pchar := LpmCacheRegistryDir(home);
+  var rc: int64 := ftMirror(registry, regDir, "/index.json"c);
+  LpmCacheFreePath(regDir);
+  return rc;
+}
+
+// Erlaubt sind nur [a-z0-9_/.-], kein fuehrender oder doppelter Slash und kein
+// Segment "..". Damit ist die Abbildung Name -> URL-Pfad -> Spiegelpfad
+// eindeutig und traversal-frei; geprueft wird vor jeder der beiden Nutzungen.
+pub fn FtNameIsSafe(name: pchar): bool {
+  if name == 0 as pchar { return false; }
+  var n: int64 := StrLen(name);
+  if n == 0 { return false; }
+  if n > 200 { return false; }
+
+  var u: int64 := name as int64;
+  if peek8(u) as int64 == 47 { return false; }
+  if peek8(u + n - 1) as int64 == 47 { return false; }
+
+  var i: int64 := 0;
+  var dots: int64 := 0;    // Punkte im laufenden Segment
+  var segLen: int64 := 0;  // Laenge des laufenden Segments
+  while i < n {
+    var c: int64 := peek8(u + i) as int64;
+    var ok: bool := false;
+    if c >= 97 { if c <= 122 { ok := true; } }        // a-z
+    if c >= 48 { if c <= 57 { ok := true; } }         // 0-9
+    if c == 95 { ok := true; }                        // _
+    if c == 45 { ok := true; }                        // -
+    if c == 46 { ok := true; }                        // .
+    if c == 47 { ok := true; }                        // /
+    if !ok { return false; }
+
+    if c == 47 {
+      if segLen == 0 { return false; }                // // oder leeres Segment
+      if dots == segLen { return false; }             // "." oder ".."
+      dots := 0;
+      segLen := 0;
+    } else {
+      if c == 46 { dots := dots + 1; }
+      segLen := segLen + 1;
+    }
+    i := i + 1;
+  }
+  if segLen == 0 { return false; }
+  if dots == segLen { return false; }
+  return true;
+}
+
+// Klartext zu einem FT_ERR_*-Code.
+pub fn FtErrStr(code: int64): pchar {
+  if code == FT_OK         { return "ok"c; }
+  if code == FT_ERR_URL    { return "Registry-URL nicht verwertbar (erwartet https://host)"c; }
+  if code == FT_ERR_NET    { return "keine Antwort von der Registry"c; }
+  if code == FT_ERR_404    { return "in der Registry nicht gefunden"c; }
+  if code == FT_ERR_HTTP   { return "Registry meldet einen Fehlerstatus"c; }
+  if code == FT_ERR_LIMIT  { return "Antwort der Registry zu gross"c; }
+  if code == FT_ERR_WRITE  { return "Spiegel liess sich nicht schreiben"c; }
+  return "unbekannter Fehler"c;
+}

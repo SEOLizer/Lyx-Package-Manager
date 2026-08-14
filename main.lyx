@@ -4,11 +4,17 @@
 @description("lpm — Lyx Package Manager entry point")
 @author("Andreas Röne")
 @copyright("2026 Andreas Röne")
-@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit])
+// network.udp.connect ist kein Tippfehler: die Namensaufloesung vor jedem
+// HTTPS-Request laeuft ueber UDP. Fehlt sie, kennt der seccomp-Filter den
+// socket(AF_INET, SOCK_DGRAM) nicht und der Prozess stirbt wortlos an SIGSYS.
+// fs.meta braucht OpenSSL fuer den CA-Store unter /usr/lib/ssl/certs.
+@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit,
+               network.tcp.connect, network.udp.connect, memory.mmap])
 unit main;
 
 import std.io grant [fs.read, fs.write];
-import lpm.cli.commands grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit];
+import lpm.cli.commands grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit,
+                               network.tcp.connect, network.udp.connect, memory.mmap];
 
 pub fn main(argc: int64, argv: pchar): int64 {
   return lpmMain(argc, argv);

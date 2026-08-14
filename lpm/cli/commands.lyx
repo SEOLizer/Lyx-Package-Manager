@@ -21,6 +21,7 @@ import lpm.core.semver;
 import lpm.core.resolver;
 import lpm.core.index;
 import lpm.core.localcat;
+import lpm.core.fetch;
 
 // ---------------------------------------------------------------------------
 // Schreib-Hilfsfunktionen (via sys_write — kein io-Import nötig)
@@ -240,14 +241,65 @@ fn lpmCacheAdd(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
 // WP-PM-06: Install-Flow
 //
 // Manifest -> Katalog -> Resolver -> lyx.lock. Der Katalog kommt aus dem
-// lokalen Cache und dem gespiegelten Registry-Index; der HTTPS-Transport, der
-// diesen Spiegel fuellt, fehlt noch (LyX-Compiler#1185). Was aufgeloest ist,
-// aber nicht im Cache liegt, wird deshalb ausgewiesen statt heruntergeladen.
+// lokalen Cache und dem gespiegelten Registry-Index. Fehlt ein Paket im
+// Katalog, holt WP-PM-05 (Teil 2) dessen Index per HTTPS nach und die
+// Aufloesung laeuft erneut — siehe cmdResolveAndLock. Der Download der
+// Archive selbst folgt mit WP-PM-07; was aufgeloest ist, aber nicht im Cache
+// liegt, wird bis dahin ausgewiesen.
 // ---------------------------------------------------------------------------
 
 con CMD_RES_OK:         int64 := 0;
 con CMD_RES_FAIL:       int64 := 1;
 con CMD_RES_INCOMPLETE: int64 := 2;
+
+// Obergrenze fuer nachgeladene Indizes je Aufloesung. Die Grenze ist eine
+// Reissleine gegen eine Registry, die immer neue Namen nachschiebt, kein
+// erwarteter Normalfall.
+con CMD_SYNC_MAX:  int64 := 64;
+con CMD_NAME_MAX:  int64 := 256;
+
+// Steht name schon in der Liste der in diesem Lauf versuchten Indizes?
+fn cmdSeenHas(seen: int64, n: int64, name: pchar): bool {
+  var i: int64 := 0;
+  while i < n {
+    if StrCmp((seen + i * CMD_NAME_MAX) as pchar, name) == 0 { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+// Kopiert name in die Liste. Rueckgabe: neue Anzahl (unveraendert, wenn der
+// Name nicht hineinpasst).
+fn cmdSeenAdd(seen: int64, n: int64, name: pchar): int64 {
+  var slen: int64 := StrLen(name);
+  if slen >= CMD_NAME_MAX { return n; }
+  memcpy(seen + n * CMD_NAME_MAX, name as int64, slen);
+  poke8(seen + n * CMD_NAME_MAX + slen, 0);
+  return n + 1;
+}
+
+// Holt den Registry-Index eines Pakets nach. Rueckgabe: true, wenn der Spiegel
+// danach neu ist und ein weiterer Aufloesungsversuch Sinn hat.
+fn cmdSyncIndex(ctx: LpmCtx, home: pchar, name: pchar): bool {
+  var registry: pchar := ctx.lcRegistry;
+  if registry == 0 as pchar { registry := arDefaultRegistry(); }
+
+  if ctx.lcVerbose {
+    cmdOut("lpm: hole Index fuer "c); cmdOut(name);
+    cmdOut(" von "c); cmdOutLn(registry);
+  }
+
+  var rc: int64 := FtSyncPackageIndex(home, registry, name);
+  if rc == FT_OK { return true; }
+
+  // FT_ERR_404 heisst schlicht: das Paket gibt es nicht. Das meldet gleich
+  // darauf der Resolver mit RS_ERR_MISSING, hier waere es doppelt.
+  if rc != FT_ERR_404 {
+    cmdOut("lpm: warning: "c); cmdOut(name); cmdOut(": "c);
+    cmdOutLn(FtErrStr(rc));
+  }
+  return false;
+}
 
 // Baut den Katalog aus allen lokal verfuegbaren Quellen auf.
 fn cmdBuildCatalog(home: pchar, cat: DepCatalog, verbose: bool): void {
@@ -323,15 +375,51 @@ fn cmdLockSatisfies(mf: Manifest, lock: LockFile): bool {
 // Der Aufrufer muss die Faelle unterscheiden: bei CMD_RES_FAIL darf lyx.toml
 // nicht veraendert werden, sonst bleibt ein unaufloesbares Paket darin stehen.
 fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
-  var cat: DepCatalog := new DepCatalog();
-  cat.DcInit();
-  cmdBuildCatalog(home, cat, ctx.lcVerbose);
+  // Aufloesen, und bei einem unbekannten Paket dessen Index nachladen und noch
+  // einmal aufloesen. Transitive Dependencies tauchen erst auf, wenn der Index
+  // ihres Elternpakets gelesen ist — deshalb die Schleife statt eines einzelnen
+  // Vorab-Downloads der Manifest-Wurzeln.
+  var seen: int64 := alloc(CMD_SYNC_MAX * CMD_NAME_MAX);
+  var seenN: int64 := 0;
 
-  var r: Resolver := new Resolver();
-  r.RsInit(cat);
-  cmdAddRoots(mf, r);
+  var cat: DepCatalog := 0 as DepCatalog;
+  var r: Resolver := 0 as Resolver;
+  var rc: int64 := 0;
 
-  var rc: int64 := r.RsResolve();
+  while true {
+    cat := new DepCatalog();
+    cat.DcInit();
+    cmdBuildCatalog(home, cat, ctx.lcVerbose);
+
+    r := new Resolver();
+    r.RsInit(cat);
+    cmdAddRoots(mf, r);
+
+    rc := r.RsResolve();
+    if rc != RS_ERR_MISSING { break; }
+    if ctx.lcOffline { break; }
+    if seenN >= CMD_SYNC_MAX { break; }
+
+    var miss: pchar := r.RsErrPkg();
+    if miss == 0 as pchar { break; }
+    if cmdSeenHas(seen, seenN, miss) { break; }
+
+    // Namen sichern, bevor der Resolver freigegeben wird — miss zeigt in ihn.
+    var before: int64 := seenN;
+    seenN := cmdSeenAdd(seen, seenN, miss);
+    if seenN == before { break; }
+    var name: pchar := (seen + before * CMD_NAME_MAX) as pchar;
+
+    // Erst holen, dann freigeben: bringt der Download nichts Neues, bleibt das
+    // vorhandene Ergebnis samt Fehlerkontext stehen und wird gemeldet.
+    if !cmdSyncIndex(ctx, home, name) { break; }
+
+    r.RsFree(); dispose r;
+    cat.DcFree(); dispose cat;
+  }
+
+  free(seen, CMD_SYNC_MAX * CMD_NAME_MAX);
+
   if rc != RS_OK {
     cmdResolveErr(r, rc);
     r.RsFree(); dispose r;
@@ -369,8 +457,7 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
 
   if missing > 0 {
     cmdOut("lpm: "c); PrintInt(missing);
-    cmdOutLn(" Paket(e) fehlen lokal. Download folgt mit WP-PM-05"c);
-    cmdOutLn("     (HTTPS ist blockiert: LyX-Compiler#1185)."c);
+    cmdOutLn(" Paket(e) fehlen lokal. Der Archiv-Download folgt mit WP-PM-07."c);
     cmdOutLn("     Solange hilft: lpm cache add <archiv.lxpkg> <name> <version>"c);
   }
 
@@ -578,6 +665,40 @@ fn lpmList(argc: int64, argv: pchar): int64 {
 }
 
 // ---------------------------------------------------------------------------
+// update — Registry-Spiegel auffrischen
+// ---------------------------------------------------------------------------
+//
+// Holt /index.json in den lokalen Spiegel. Die Paket-Indizes kommen weiterhin
+// bedarfsgetrieben beim Aufloesen (siehe cmdResolveAndLock); `update` ist der
+// Weg, den Gesamtindex fuer `lpm search` (WP-PM-09) frisch zu bekommen.
+fn lpmUpdate(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  if ctx.lcOffline {
+    cmdErr("update braucht Netzwerk, --offline ist gesetzt."c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  if home == 0 as pchar {
+    cmdErr("HOME ist nicht gesetzt."c);
+    return 1;
+  }
+
+  var registry: pchar := ctx.lcRegistry;
+  if registry == 0 as pchar { registry := arDefaultRegistry(); }
+
+  var rc: int64 := FtSyncRootIndex(home, registry);
+  if rc != FT_OK {
+    cmdOut("lpm: error: "c); cmdOut(registry); cmdOut(": "c);
+    cmdOutLn(FtErrStr(rc));
+    return 1;
+  }
+
+  cmdOut("lpm: Index von "c); cmdOut(registry);
+  cmdOutLn(" aktualisiert."c);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Stubs für netzwerkabhängige Befehle
 // ---------------------------------------------------------------------------
 
@@ -602,7 +723,7 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if StrCmp(cmd, "init"c)    == 0 { return lpmInit(ctx); }
   if StrCmp(cmd, "install"c) == 0 { return lpmInstall(ctx, argc, argv); }
   if StrCmp(cmd, "remove"c)  == 0 { return lpmRemove(ctx, argc, argv); }
-  if StrCmp(cmd, "update"c)  == 0 { return lpmNotImpl("update"c); }
+  if StrCmp(cmd, "update"c)  == 0 { return lpmUpdate(ctx, argc, argv); }
   if StrCmp(cmd, "search"c)  == 0 { return lpmNotImpl("search"c); }
   if StrCmp(cmd, "info"c)    == 0 { return lpmNotImpl("info"c); }
   if StrCmp(cmd, "list"c)    == 0 { return lpmList(argc, argv); }

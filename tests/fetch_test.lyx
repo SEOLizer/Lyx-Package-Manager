@@ -1,0 +1,131 @@
+// tests/fetch_test.lyx
+// WP-PM-05 (Teil 2): Tests fuer den Registry-Transport, ohne Netzzugriff.
+//
+// Getestet wird, was ohne Server pruefbar ist: die Namensregel, die aus einem
+// Paketnamen einen URL- und Spiegelpfad macht, und dass eine unbrauchbare
+// Registry-URL abgelehnt wird, bevor irgendeine Verbindung aufgebaut wird.
+// Der Transport selbst haengt an einer erreichbaren Registry und wird von Hand
+// geprueft (`lpm update`).
+//
+// Bauen und ausfuehren:  make test
+
+@description("lpm registry fetch tests")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.exit,
+               network.tcp.connect, network.udp.connect, memory.mmap])
+unit main;
+
+import std.io grant [fs.read, fs.write];
+import lpm.core.cache grant [fs.read, fs.write, fs.create, fs.delete, fs.meta];
+import lpm.core.fetch grant [fs.read, fs.write, fs.create, fs.delete, fs.meta,
+                             network.tcp.connect, network.udp.connect, memory.mmap];
+
+var tsPass: int64 := 0;
+var tsFail: int64 := 0;
+
+fn out(s: pchar): void {
+  if s == 0 as pchar { sys_write(1, "(null)"c as int64, 6); return; }
+  sys_write(1, s as int64, StrLen(s));
+}
+fn outLn(s: pchar): void { out(s); sys_write(1, "\n"c as int64, 1); }
+
+fn ok(name: pchar, cond: bool): void {
+  if cond {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); outLn(name);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Namensregel (docs/registry.md: erlaubt sind [a-z0-9_/.-])
+// ---------------------------------------------------------------------------
+
+fn testNamesOk(): void {
+  outLn("zulaessige Paketnamen"c);
+  ok("flach"c,          FtNameIsSafe("buffer"c));
+  ok("hierarchisch"c,   FtNameIsSafe("net/http"c));
+  ok("drei Ebenen"c,    FtNameIsSafe("std/net/tls"c));
+  ok("Ziffern"c,        FtNameIsSafe("base64"c));
+  ok("Bindestrich"c,    FtNameIsSafe("json-rpc"c));
+  ok("Unterstrich"c,    FtNameIsSafe("my_pkg"c));
+  ok("Punkt im Namen"c, FtNameIsSafe("core.io"c));
+}
+
+fn testNamesRejected(): void {
+  outLn("abgelehnte Paketnamen"c);
+  ok("leer"c,               !FtNameIsSafe(""c));
+  ok("nullzeiger"c,         !FtNameIsSafe(0 as pchar));
+  ok("fuehrender Slash"c,   !FtNameIsSafe("/net/http"c));
+  ok("nachlaufender Slash"c,!FtNameIsSafe("net/http/"c));
+  ok("doppelter Slash"c,    !FtNameIsSafe("net//http"c));
+  ok("Traversal .."c,       !FtNameIsSafe("net/../etc"c));
+  ok("Traversal am Ende"c,  !FtNameIsSafe("net/.."c));
+  ok("nur ein Punkt"c,      !FtNameIsSafe("."c));
+  ok("Grossbuchstaben"c,    !FtNameIsSafe("Net/Http"c));
+  ok("Leerzeichen"c,        !FtNameIsSafe("net http"c));
+  ok("Backslash"c,          !FtNameIsSafe("net\\http"c));
+  ok("Doppelpunkt"c,        !FtNameIsSafe("net:http"c));
+  ok("Prozentzeichen"c,     !FtNameIsSafe("net%2fhttp"c));
+  ok("Fragezeichen"c,       !FtNameIsSafe("net/http?x=1"c));
+}
+
+// ---------------------------------------------------------------------------
+// URL-Pruefung — greift vor jedem Verbindungsaufbau
+// ---------------------------------------------------------------------------
+
+fn testUrlRejected(): void {
+  outLn("abgelehnte Registry-URLs"c);
+  var home: pchar := "/nonexistent-lpm-test"c;
+
+  // Der unsichere Name schlaegt zu, bevor die URL ueberhaupt betrachtet wird.
+  ok("unsicherer Name"c,
+     FtSyncPackageIndex(home, "https://example.org"c, "../etc"c) == FT_ERR_URL);
+
+  ok("http statt https"c,
+     FtSyncPackageIndex(home, "http://example.org"c, "net/http"c) == FT_ERR_URL);
+  ok("ohne Schema"c,
+     FtSyncPackageIndex(home, "example.org"c, "net/http"c) == FT_ERR_URL);
+  ok("leere URL"c,
+     FtSyncPackageIndex(home, ""c, "net/http"c) == FT_ERR_URL);
+  ok("nullzeiger"c,
+     FtSyncPackageIndex(home, 0 as pchar, "net/http"c) == FT_ERR_URL);
+  ok("nur Schema"c,
+     FtSyncPackageIndex(home, "https://"c, "net/http"c) == FT_ERR_URL);
+  ok("Port nicht unterstuetzt"c,
+     FtSyncPackageIndex(home, "https://example.org:8443"c, "net/http"c) == FT_ERR_URL);
+}
+
+// ---------------------------------------------------------------------------
+// Fehlertexte
+// ---------------------------------------------------------------------------
+
+fn testErrStr(): void {
+  outLn("Fehlertexte"c);
+  ok("FT_OK"c,        StrCmp(FtErrStr(FT_OK), "ok"c) == 0);
+  ok("FT_ERR_404"c,   FtErrStr(FT_ERR_404) != 0 as pchar);
+  ok("FT_ERR_NET"c,   FtErrStr(FT_ERR_NET) != 0 as pchar);
+  ok("unbekannt"c,    FtErrStr(0 - 99) != 0 as pchar);
+}
+
+// ---------------------------------------------------------------------------
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  outLn("fetch tests"c);
+  outLn(""c);
+  testNamesOk();
+  testNamesRejected();
+  testUrlRejected();
+  testErrStr();
+
+  outLn(""c);
+  out("bestanden: "c); PrintInt(tsPass);
+  out("   fehlgeschlagen: "c); PrintInt(tsFail);
+  outLn(""c);
+
+  if tsFail > 0 { return 1; }
+  return 0;
+}
