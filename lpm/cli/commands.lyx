@@ -318,6 +318,63 @@ fn cmdBuildCatalog(home: pchar, cat: DepCatalog, verbose: bool): void {
   }
 }
 
+// WP-PM-07: Holt <name>@<version> aus der Registry und legt es im Cache ab.
+//
+// Reihenfolge: herunterladen nach ~/.lpm/tmp, SHA256 gegen den Lock-Eintrag
+// pruefen, erst dann entpacken. Ein Archiv mit falschem Hash wird geloescht und
+// nie ausgepackt — es koennte beliebige Dateien mitbringen.
+//
+// Rueckgabe: true, wenn das Paket danach im Cache liegt.
+fn cmdFetchPkg(ctx: LpmCtx, home: pchar, name: pchar, version: pchar,
+               sha256: pchar): bool {
+  if sha256 == 0 as pchar { return false; }
+
+  var registry: pchar := ctx.lcRegistry;
+  if registry == 0 as pchar { registry := arDefaultRegistry(); }
+
+  cmdOut("lpm: hole "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+  cmdOut(" von "c); cmdOutLn(registry);
+
+  var slot: int64 := alloc(8);
+  var rc: int64 := FtDownloadArchive(home, registry, name, version, slot);
+  var arch: int64 := peek64(slot);
+  free(slot, 8);
+
+  if rc != FT_OK {
+    cmdOut("lpm: warning: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+    cmdOut(": "c); cmdOutLn(FtErrStr(rc));
+    return false;
+  }
+
+  var dest: pchar := LpmCachePkgPath(home, name, version);
+  var urc: int64 := LpmUnpackLxpkgVerified(arch as pchar, dest, sha256);
+
+  DeleteFile(arch as pchar);
+  FtFreePath(arch);
+
+  if urc < 0 {
+    // Das Zielverzeichnis wird vom Entpacker angelegt, bevor die erste Datei
+    // geschrieben ist. Bleibt es nach einem Fehler stehen, haelt LpmCacheHas
+    // das Paket beim naechsten Lauf faelschlich fuer installiert.
+    LpmCacheDropPkg(home, name, version);
+
+    cmdOut("lpm: error: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+    cmdOut(": "c); cmdOutLn(LpmArchiveErrStr(urc));
+    if urc == LPA_ERR_HASH {
+      cmdOutLn("     Der Lock-Eintrag hat Vorrang — die Registry liefert etwas anderes."c);
+    }
+    LpmCacheFreePath(dest);
+    return false;
+  }
+
+  if ctx.lcVerbose {
+    cmdOut("lpm: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+    cmdOut(" entpackt ("c); PrintInt(urc); cmdOutLn(" Datei(en))."c);
+  }
+  LpmCacheFreePath(dest);
+  return true;
+}
+
 // Traegt alle Dependencies des Manifests als Wurzeln ein.
 fn cmdAddRoots(mf: Manifest, r: Resolver): void {
   var i: int64 := 0;
@@ -434,7 +491,9 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
   var written: bool := lock.LfWrite("lyx.lock"c);
   if !written { cmdErr("lyx.lock konnte nicht geschrieben werden."c); }
 
-  // Was fehlt noch im Cache?
+  // Was fehlt noch im Cache? Was fehlt, wird geholt — der sha256 kommt dabei
+  // aus dem gerade geschriebenen lyx.lock, nicht aus dem Index: der Lock-Eintrag
+  // hat immer Vorrang (docs/registry.md, Abschnitt Integritaet).
   var missing: int64 := 0;
   var n: int64 := 0;
   while n < r.RsCount() {
@@ -446,8 +505,15 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
         cmdOutLn(" liegt im Cache."c);
       }
     } else {
-      missing := missing + 1;
-      cmdOut("lpm: fehlt im Cache: "c); cmdOut(nm); cmdOut("@"c); cmdOutLn(vr);
+      var got: bool := false;
+      if !ctx.lcOffline {
+        var li: int64 := lock.LfFind(nm);
+        if li >= 0 { got := cmdFetchPkg(ctx, home, nm, vr, lock.LfGetSha256(li)); }
+      }
+      if !got {
+        missing := missing + 1;
+        cmdOut("lpm: fehlt im Cache: "c); cmdOut(nm); cmdOut("@"c); cmdOutLn(vr);
+      }
     }
     n := n + 1;
   }
@@ -457,8 +523,8 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
 
   if missing > 0 {
     cmdOut("lpm: "c); PrintInt(missing);
-    cmdOutLn(" Paket(e) fehlen lokal. Der Archiv-Download folgt mit WP-PM-07."c);
-    cmdOutLn("     Solange hilft: lpm cache add <archiv.lxpkg> <name> <version>"c);
+    cmdOutLn(" Paket(e) fehlen lokal und liessen sich nicht holen."c);
+    cmdOutLn("     Hilft auch: lpm cache add <archiv.lxpkg> <name> <version>"c);
   }
 
   lock.LfFree(); dispose lock;

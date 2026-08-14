@@ -100,6 +100,41 @@ fn testUrlRejected(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Versionsregel — Versionen gehen genauso in einen Pfad wie Namen
+// ---------------------------------------------------------------------------
+
+fn testVersions(): void {
+  outLn("Versionen"c);
+  ok("einfach"c,        FtVersionIsSafe("1.2.0"c));
+  ok("prerelease"c,     FtVersionIsSafe("1.0.0-rc.1"c));
+  ok("build"c,          FtVersionIsSafe("1.0.0+build7"c));
+  ok("nullversion"c,    FtVersionIsSafe("0.0.0-test"c));
+  ok("leer"c,          !FtVersionIsSafe(""c));
+  ok("nullzeiger"c,    !FtVersionIsSafe(0 as pchar));
+  ok("Slash"c,         !FtVersionIsSafe("1.0/0"c));
+  ok("Traversal"c,     !FtVersionIsSafe(".."c));
+  ok("ein Punkt"c,     !FtVersionIsSafe("."c));
+  ok("Grossbuchstabe"c,!FtVersionIsSafe("1.0.0-RC1"c));
+  ok("Leerzeichen"c,   !FtVersionIsSafe("1.0.0 "c));
+}
+
+fn testArchiveRejected(): void {
+  outLn("abgelehnte Archiv-Downloads"c);
+  var home: pchar := "/nonexistent-lpm-test"c;
+  var slot: int64 := alloc(8);
+
+  ok("unsicherer Name"c,
+     FtDownloadArchive(home, "https://example.org"c, "../etc"c, "1.0.0"c, slot) == FT_ERR_URL);
+  ok("unsichere Version"c,
+     FtDownloadArchive(home, "https://example.org"c, "net/http"c, "../../etc"c, slot) == FT_ERR_URL);
+  ok("http statt https"c,
+     FtDownloadArchive(home, "http://example.org"c, "net/http"c, "1.0.0"c, slot) == FT_ERR_URL);
+  ok("kein Pfad gesetzt"c, peek64(slot) == 0);
+
+  free(slot, 8);
+}
+
+// ---------------------------------------------------------------------------
 // Fehlertexte
 // ---------------------------------------------------------------------------
 
@@ -119,6 +154,8 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testNamesOk();
   testNamesRejected();
   testUrlRejected();
+  testVersions();
+  testArchiveRejected();
   testErrStr();
 
   outLn(""c);

@@ -74,6 +74,14 @@ pub fn LpmCacheRegistryDir(home: pchar): pchar {
   return lpcRootPath(home, "/registry"c);
 }
 
+// ~/.lpm/tmp — Ablage fuer heruntergeladene Archive, bevor sie geprueft und
+// entpackt sind. Bewusst neben dem Cache und nicht darin: ein halb geladenes
+// Archiv darf nie wie ein installiertes Paket aussehen. Bewusst auch nicht in
+// /tmp, damit Download und Cache auf demselben Dateisystem liegen.
+pub fn LpmCacheTmpDir(home: pchar): pchar {
+  return lpcRootPath(home, "/tmp"c);
+}
+
 // ~/.lpm/cache/<name>/<version>
 // name darf Slashes enthalten ("net/http") — die Struktur bildet sich direkt ab.
 pub fn LpmCachePkgPath(home: pchar, name: pchar, version: pchar): pchar {
@@ -110,6 +118,12 @@ pub fn LpmCacheEnsure(home: pchar): bool {
   if !ok { return false; }
 
   sub := lpcRootPath(home, "/registry"c);
+  if !IsDirectory(sub) { Mkdir(sub, LPC_DIR_MODE); }
+  ok := IsDirectory(sub);
+  LpmCacheFreePath(sub);
+  if !ok { return false; }
+
+  sub := lpcRootPath(home, "/tmp"c);
   if !IsDirectory(sub) { Mkdir(sub, LPC_DIR_MODE); }
   ok := IsDirectory(sub);
   LpmCacheFreePath(sub);
@@ -275,6 +289,22 @@ fn lpcRemoveTree(dirPath: pchar, depth: int64): int64 {
 
   LpmDirClose(dl);
   return removed;
+}
+
+// Entfernt ~/.lpm/cache/<name>/<version>/ samt Inhalt.
+//
+// Gebraucht wird das, wenn ein Entpacken abbricht: LpmCacheHas prueft nur, ob
+// das Versionsverzeichnis existiert, und ein leeres oder halb gefuelltes
+// Verzeichnis wuerde beim naechsten Lauf als installiertes Paket durchgehen.
+// Rueckgabe: true, wenn das Verzeichnis danach weg ist.
+pub fn LpmCacheDropPkg(home: pchar, name: pchar, version: pchar): bool {
+  var p: pchar := LpmCachePkgPath(home, name, version);
+  if !IsDirectory(p) { LpmCacheFreePath(p); return true; }
+  lpcRemoveTree(p, 0);
+  Rmdir(p);
+  var gone: bool := !IsDirectory(p);
+  LpmCacheFreePath(p);
+  return gone;
 }
 
 // Leert ~/.lpm/cache/ vollstaendig, laesst das Verzeichnis selbst bestehen.

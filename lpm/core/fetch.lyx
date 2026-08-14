@@ -38,7 +38,9 @@ pub con FT_ERR_WRITE: int64 := 0 - 6;   // Spiegel liess sich nicht schreiben
 
 con FT_PATH_MAX: int64 := 4096;
 con FT_HOST_MAX: int64 := 256;
-con FT_BODY_MAX: int64 := 4194304;   // 4 MiB — ein Index, kein Archiv
+con FT_BODY_MAX: int64 := 4194304;      // 4 MiB — Grenze fuer einen Index
+con FT_ARCHIVE_MAX: int64 := 67108864;  // 64 MiB — Grenze fuer ein .lxpkg,
+                                        // gleich der Entpack-Grenze in archive.lyx
 con FT_DIR_MODE: int64 := 493;       // 0755
 
 // ---------------------------------------------------------------------------
@@ -123,7 +125,7 @@ fn ftUrlOk(registry: pchar): bool {
 // nullterminierten Puffer ab. *outBuf/*outLen sind Zeiger auf int64-Slots.
 // Rueckgabe: FT_OK oder ein FT_ERR_*-Code. Bei allem ausser FT_OK bleibt
 // *outBuf 0.
-fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64): int64 {
+fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64, maxLen: int64): int64 {
   poke64(outBuf, 0);
   poke64(outLen, 0);
 
@@ -145,7 +147,7 @@ fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64): int64 {
     HTTPResponseFree(resp);
     return FT_ERR_NET;
   }
-  if resp.bodySize > FT_BODY_MAX {
+  if resp.bodySize > maxLen {
     HTTPResponseFree(resp);
     return FT_ERR_LIMIT;
   }
@@ -240,7 +242,7 @@ fn ftMirror(registry: pchar, regDir: pchar, relPath: pchar): int64 {
   ftEnd(req, p);
 
   var bodySlot: int64 := alloc(16);
-  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8);
+  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8, FT_BODY_MAX);
   free(req, FT_PATH_MAX);
   free(host, FT_HOST_MAX);
 
@@ -287,6 +289,118 @@ pub fn FtSyncPackageIndex(home: pchar, registry: pchar, name: pchar): int64 {
   LpmCacheFreePath(regDir);
   free(rel, FT_PATH_MAX);
   return rc;
+}
+
+// Laedt /packages/<name>/<version>.lxpkg nach ~/.lpm/tmp/ herunter und liefert
+// den Pfad der geladenen Datei (frisch alloziert, mit FtFreePath freigeben)
+// ueber pathOut, einen Zeiger auf einen int64-Slot.
+//
+// Absichtlich wird der Pfad aus Name und Version nach docs/registry.md gebildet
+// und NICHT das source-Feld des Index verwendet: sonst koennte ein manipulierter
+// Index den Download auf einen fremden Host umlenken. Der Registry-Host ist die
+// einzige Bezugsquelle; das source-Feld bleibt Information fuer Menschen.
+//
+// Die Datei ist nach der Rueckkehr ungeprueft. Der Aufrufer muss den SHA256
+// gegen lyx.lock pruefen (LpmUnpackLxpkgVerified), bevor der Inhalt in den
+// Cache wandert.
+pub fn FtDownloadArchive(home: pchar, registry: pchar, name: pchar,
+                         version: pchar, pathOut: int64): int64 {
+  poke64(pathOut, 0);
+  if !FtNameIsSafe(name) { return FT_ERR_URL; }
+  if !FtVersionIsSafe(version) { return FT_ERR_URL; }
+  if !ftUrlOk(registry) { return FT_ERR_URL; }
+  if !LpmCacheEnsure(home) { return FT_ERR_WRITE; }
+
+  var host: int64 := alloc(FT_HOST_MAX);
+  var baseOff: int64 := ftSplitUrl(registry, host);
+
+  var req: int64 := alloc(FT_PATH_MAX);
+  var p: int64 := 0;
+  p := ftAppend(req, p, (registry as int64 + baseOff) as pchar);
+  p := ftAppend(req, p, "/packages/"c);
+  p := ftAppend(req, p, name);
+  p := ftAppend(req, p, "/"c);
+  p := ftAppend(req, p, version);
+  p := ftAppend(req, p, ".lxpkg"c);
+  ftEnd(req, p);
+
+  var bodySlot: int64 := alloc(16);
+  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8, FT_ARCHIVE_MAX);
+  free(req, FT_PATH_MAX);
+  free(host, FT_HOST_MAX);
+
+  if rc != FT_OK {
+    free(bodySlot, 16);
+    return rc;
+  }
+
+  var body: int64 := peek64(bodySlot);
+  var len: int64 := peek64(bodySlot + 8);
+  free(bodySlot, 16);
+
+  // Dateiname im tmp-Verzeichnis: Slashes des Paketnamens werden zu '-', damit
+  // kein Unterverzeichnis noetig ist und zwei Pakete sich nicht ins Gehege
+  // kommen (net/http@1.0.0 -> net-http@1.0.0.lxpkg).
+  var tmpDir: pchar := LpmCacheTmpDir(home);
+  var dst: int64 := alloc(FT_PATH_MAX);
+  p := 0;
+  p := ftAppend(dst, p, tmpDir);
+  p := ftAppend(dst, p, "/"c);
+  var start: int64 := p;
+  p := ftAppend(dst, p, name);
+  var i: int64 := start;
+  while i < p {
+    if peek8(dst + i) as int64 == 47 { poke8(dst + i, 45 as int8); }
+    i := i + 1;
+  }
+  p := ftAppend(dst, p, "@"c);
+  p := ftAppend(dst, p, version);
+  p := ftAppend(dst, p, ".lxpkg"c);
+  ftEnd(dst, p);
+  LpmCacheFreePath(tmpDir);
+
+  var ok: bool := ftWriteAtomic(dst, body, len);
+  FtFreeBody(body, len);
+
+  if !ok {
+    free(dst, FT_PATH_MAX);
+    return FT_ERR_WRITE;
+  }
+
+  poke64(pathOut, dst);
+  return FT_OK;
+}
+
+// Gibt einen von FtDownloadArchive gelieferten Pfad frei.
+pub fn FtFreePath(p: int64): void {
+  if p != 0 { free(p, FT_PATH_MAX); }
+}
+
+// Versionen gehen genauso in einen Pfad wie Namen und werden genauso geprueft.
+// Erlaubt sind [0-9a-z.+-] — das deckt SemVer inklusive Prerelease und
+// Build-Metadaten ab, ohne Slash und ohne Punkt-Segmente.
+pub fn FtVersionIsSafe(version: pchar): bool {
+  if version == 0 as pchar { return false; }
+  var n: int64 := StrLen(version);
+  if n == 0 { return false; }
+  if n > 64 { return false; }
+
+  var u: int64 := version as int64;
+  var i: int64 := 0;
+  var dots: int64 := 0;
+  while i < n {
+    var c: int64 := peek8(u + i) as int64;
+    var ok: bool := false;
+    if c >= 97 { if c <= 122 { ok := true; } }    // a-z
+    if c >= 48 { if c <= 57 { ok := true; } }     // 0-9
+    if c == 46 { ok := true; dots := dots + 1; }  // .
+    if c == 45 { ok := true; }                    // -
+    if c == 43 { ok := true; }                    // +
+    if !ok { return false; }
+    i := i + 1;
+  }
+  if dots == n { return false; }                  // "." und ".."
+  return true;
 }
 
 // Spiegelt /index.json (Gesamtindex fuer `lpm search`).
