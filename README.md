@@ -9,9 +9,9 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 > **Status: frühe Entwicklung (v0.1.0).** Der Install-Flow läuft end-to-end gegen
 > die öffentliche Registry: leerer Cache → Index per HTTPS → Auflösung → Archiv
 > per HTTPS → SHA256-Prüfung → entpackt im Cache. Funktionsfähig sind `init`,
-> `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list` und
-> `update`. Es fehlen `search`, `info`, `publish`, `login` und `resolve` — siehe
-> [Roadmap](#roadmap).
+> `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list`,
+> `update`, `search` und `info`. Es fehlen `publish`, `login` und `resolve` —
+> siehe [Roadmap](#roadmap).
 >
 > Benötigt `lyxc` ≥ 1.0.19E (HTTPS; ohne Netzwerknutzung genügt 1.0.13J).
 
@@ -74,8 +74,8 @@ lpm <subcommand> [optionen]
 | `lpm install [<pkg[@ver]>]` | Auflösen, herunterladen, verifizieren, `lyx.lock` schreiben | ✅ |
 | `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen, Lock neu schreiben | ✅ |
 | `lpm update` | Registry-Gesamtindex neu spiegeln | ✅ |
-| `lpm search <query>` | Registry durchsuchen | ⬜ |
-| `lpm info <pkg>` | Paketdetails anzeigen | ⬜ |
+| `lpm search <query>` | Registry durchsuchen (Name und Beschreibung) | ✅ |
+| `lpm info <pkg>` | Paketdetails und Versionsliste anzeigen | ✅ |
 | `lpm list` | Aufgelöste Pakete aus `lyx.lock` anzeigen | ✅ |
 | `lpm publish` | Paket in die Registry hochladen | ⬜ |
 | `lpm login` | Registry-Authentifizierung | ⬜ |
@@ -202,9 +202,11 @@ lyx-lpm/
       resolver.lyx         Versions-Katalog, Auflösung, Konflikte, Topo-Sort
       index.lyx            Parser für die Registry-Indizes (JSON)
       localcat.lyx         Katalog aus Cache und gespiegelten Indizes
+      fetch.lyx            HTTPS-Transport, Spiegel, TTL
   tests/
     resolver_test.lyx      Resolver-Tests (ohne Netz und Dateisystem)
     index_test.lyx         Parser-Tests
+    fetch_test.lyx         Namens-, Versions- und URL-Regeln des Transports
 ```
 
 ### Grenzen des Resolvers
@@ -299,9 +301,11 @@ Elternpakets gelesen ist. Was aufgelöst ist und nicht im Cache liegt, wird
 heruntergeladen, gegen den `sha256` aus `lyx.lock` geprüft und erst dann
 entpackt. Ein zweites `lpm install` ohne Änderung rechnet nicht neu.
 
-Offen in M2: `lpm search` und `lpm info` (Akzeptanzkriterien von PM-05) sowie
-die ETag-Revalidierung des Index-Spiegels samt 1-h-TTL — beides in
-`docs/registry.md` beschrieben, im Client noch nicht umgesetzt.
+`lpm search` und `lpm info` lesen den Gesamtindex `/index.json`; der Spiegel
+bekommt eine TTL von einer Stunde (Zeitstempel in einer `.meta` neben jeder
+gespiegelten Datei), `lpm update` umgeht sie ausdrücklich. Damit ist M2
+inhaltlich abgeschlossen — offen bleibt die ETag-Revalidierung, die an einem
+stdlib-Bug hängt (siehe unten).
 
 Ursprünglich war eine Go-Implementierung für V1 mit späterem Port nach Lyx
 vorgesehen. Das Self-Hosting wurde vorgezogen — `lpm` ist von Beginn an in Lyx
@@ -370,6 +374,21 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
   `network.tcp.connect`, `network.udp.connect`, `memory.mmap`, `fs.read`,
   `fs.meta`. `fs.meta` braucht OpenSSL für den CA-Store unter
   `/usr/lib/ssl/certs`.
+- **`std.net.https` liefert keine Response-Header**
+  ([#1534](https://github.com/SEOLizer/LyX-Compiler/issues/1534)): `headersRaw`
+  und `headersSize` werden nie gesetzt — es gibt also keine Quelle für den
+  `ETag`, und `HTTPResponseFree` ruft `munmap` auf einen undefinierten Zeiger.
+  In `lpm` ist die ETag-Revalidierung deshalb vorbereitet, aber abgeschaltet:
+  `If-None-Match` wird gesendet und `304` ausgewertet, die TTL trägt die
+  Revalidierung solange allein.
+- **`std.fs.FileModTime` liefert immer 0**
+  ([#1533](https://github.com/SEOLizer/LyX-Compiler/issues/1533)): gelesen wird
+  Offset 80 des `stat`-Puffers, dort steht auf x86_64 `st_atime_nsec` statt
+  `st_mtime` (Offset 88). `lpm` liest die mtime deshalb selbst, sonst wäre die
+  Index-TTL nie abgelaufen.
+- **`system.time` ist eine eigene Capability** — fehlt sie, stirbt jeder Aufruf,
+  der die Uhr braucht, wortlos an SIGSYS. Gilt für alles, was `std.time`
+  benutzt.
 - **Historisch, alle behoben:** `std.fs` zog früher über
   `extern fn time ... link "libc.so.6"` einen Dynamiklink in jedes Programm
   ([#1191](https://github.com/SEOLizer/LyX-Compiler/issues/1191)); `sys_sendto`
