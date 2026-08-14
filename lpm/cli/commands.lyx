@@ -479,6 +479,13 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
 
   if rc != RS_OK {
     cmdResolveErr(r, rc);
+    // Ohne diesen Hinweis liest sich RS_ERR_MISSING wie eine Aussage ueber die
+    // Registry, obwohl mit --offline nur der lokale Spiegel befragt wurde.
+    if rc == RS_ERR_MISSING {
+      if ctx.lcOffline {
+        cmdOutLn("     --offline ist gesetzt — gesucht wurde nur im lokalen Spiegel."c);
+      }
+    }
     r.RsFree(); dispose r;
     cat.DcFree(); dispose cat;
     return CMD_RES_FAIL;
