@@ -6,13 +6,14 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 
 `lpm` ist selbst vollständig in Lyx geschrieben und wird mit `lyxc` übersetzt.
 
-> **Status: frühe Entwicklung (v0.1.0).** Funktionsfähig sind `init`, `cache list`,
-> `cache clean`, `cache add` (lokales `.lxpkg` entpacken) sowie `install`,
-> `remove` und `list` gegen lokale Katalog-Quellen. Es fehlt der Download: der
-> HTTPS-Transport zur Registry ist noch nicht angebunden — siehe
+> **Status: frühe Entwicklung (v0.1.0).** Der Install-Flow läuft end-to-end gegen
+> die öffentliche Registry: leerer Cache → Index per HTTPS → Auflösung → Archiv
+> per HTTPS → SHA256-Prüfung → entpackt im Cache. Funktionsfähig sind `init`,
+> `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list` und
+> `update`. Es fehlen `search`, `info`, `publish`, `login` und `resolve` — siehe
 > [Roadmap](#roadmap).
 >
-> Benötigt `lyxc` ≥ 1.0.13J.
+> Benötigt `lyxc` ≥ 1.0.19E (HTTPS; ohne Netzwerknutzung genügt 1.0.13J).
 
 ---
 
@@ -44,8 +45,9 @@ cd lyx-lpm
 make
 ```
 
-Das Ergebnis ist ein statisch gelinktes Binary unter `bin/lpm` (~120 KB, keine
-Laufzeit-Abhängigkeiten).
+Das Ergebnis ist ein Binary unter `bin/lpm`. Es ist gegen `libssl`/`libcrypto`
+dynamisch gelinkt, seit `std.net.https` für den Registry-Zugriff dazugekommen
+ist — siehe [Sicherheit](#sicherheit).
 
 Die Pfade zu `lyxc` und zum `aurum`-Baum stehen oben im `Makefile` und müssen
 gegebenenfalls angepasst werden:
@@ -69,9 +71,9 @@ lpm <subcommand> [optionen]
 | `lpm cache list` | Gecachte Pakete anzeigen | ✅ |
 | `lpm cache clean` | Lokalen Cache leeren | ✅ |
 | `lpm cache add <f> <n> <v>` | Lokales `.lxpkg` in den Cache entpacken | ✅ |
-| `lpm install [<pkg[@ver]>]` | Auflösen und `lyx.lock` schreiben (ohne Download) | ⚠️ |
+| `lpm install [<pkg[@ver]>]` | Auflösen, herunterladen, verifizieren, `lyx.lock` schreiben | ✅ |
 | `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen, Lock neu schreiben | ✅ |
-| `lpm update [<pkg>]` | Paket(e) aktualisieren | ⬜ |
+| `lpm update` | Registry-Gesamtindex neu spiegeln | ✅ |
 | `lpm search <query>` | Registry durchsuchen | ⬜ |
 | `lpm info <pkg>` | Paketdetails anzeigen | ⬜ |
 | `lpm list` | Aufgelöste Pakete aus `lyx.lock` anzeigen | ✅ |
@@ -253,10 +255,16 @@ Der ausführliche Fahrplan liegt im `aurum`-Repository unter
 | Meilenstein | Work Packages | Ergebnis | Status |
 |-------------|---------------|----------|--------|
 | M1 Offline-Grundlage | PM-01 – PM-03 | `init`, `cache`, lokale Pakete | ✅ |
-| M2 Install-Flow | PM-04 – PM-06 | `install` gegen Registry | 🟡 in Arbeit |
+| M2 Install-Flow | PM-04 – PM-06 | `install` gegen Registry | 🟡 fast fertig |
 | M3 Compiler-Integration | PM-07 | `lyxc` löst Imports automatisch auf | ⬜ |
 | M4 Ökosystem-Launch | PM-08 – PM-10 | `publish` + öffentliche Registry | ⬜ |
 | M5 Enterprise | PM-11 | Monorepo-/Workspace-Support | ⬜ |
+
+> **Zur WP-Nummerierung:** die Commits `008a511` und `1155cf2` sprechen von
+> „PM-07", meinen aber den Archiv-Download — der gehört laut Fahrplan zu
+> **WP-PM-06** (Schritte 4–6 des Install-Flows). WP-PM-07 ist die
+> Compiler-Integration und noch offen. Die Historie bleibt wie sie ist,
+> maßgeblich ist diese Tabelle.
 
 **Aktueller Stand:** PM-01 (SemVer, Manifest, Lock-File) und PM-02
 (CLI-Grundstruktur) sind abgeschlossen. PM-03 ist abgeschlossen — der `.lxpkg`-Entpacker liegt in
@@ -273,19 +281,27 @@ unvereinbaren Constraints und sortiert topologisch. 28 Tests, `make test`.
 Der Resolver hängt nicht am Netzwerk: seine Datenquelle ist ein `DepCatalog`,
 den PM-05 aus dem Registry-Index füllt und die Tests direkt befüllen.
 
-PM-06 (`install`, `remove`, `list`) ist verdrahtet: Manifest → Katalog →
-Resolver → `lyx.lock`. Der Katalog kommt aus zwei lokalen Quellen — den
-entpackten Paketen unter `~/.lpm/cache/` (Dependencies aus deren `lyx.toml`)
-und den gespiegelten Registry-Indizes unter `~/.lpm/registry/packages/`.
-Ein zweites `lpm install` ohne Änderung rechnet nicht neu. Was aufgelöst ist,
-aber lokal fehlt, wird ausgewiesen statt heruntergeladen — der Download hängt
-am fehlenden HTTPS-Transport.
+PM-05 ist fertig, in zwei Teilen. Der Index-Parser (`lpm/core/index.lyx`) liest
+`/packages/<name>/index.json` in den `DepCatalog`, überspringt
+`yanked`-Versionen, überliest unbekannte Schlüssel und lehnt einen Index ab,
+dessen `name` nicht zum angeforderten Paket passt. Der Transport
+(`lpm/core/fetch.lyx`) holt Index und Archiv per HTTPS und schreibt sie über
+`.tmp` + `Rename` in den Spiegel unter `~/.lpm/registry/`. Geparst wird
+weiterhin aus dem Spiegel — der Resolver sieht keinen Unterschied zwischen
+„gerade geholt" und „war schon da", und `--offline` heißt schlicht, dass der
+Transport nicht aufgerufen wird.
 
-Von PM-05 ist der Index-Parser fertig (`lpm/core/index.lyx`): er liest
-`/packages/<name>/index.json` in den `DepCatalog`, überspringt `yanked`-Versionen,
-überliest unbekannte Schlüssel und lehnt einen Index ab, dessen `name` nicht zum
-angeforderten Paket passt. Der HTTPS-Transport fehlt noch — siehe unten, `getpid`
-wird vom seccomp-Filter blockiert, sobald OpenSSL ins Spiel kommt.
+PM-06 ist verdrahtet: Manifest → Katalog → Resolver → Download → Verify →
+Cache → `lyx.lock`. Der Katalog kommt aus dem lokalen Cache und den
+gespiegelten Indizes; fehlt ein Paket, wird sein Index nachgeladen und erneut
+aufgelöst — transitive Abhängigkeiten tauchen erst auf, wenn der Index ihres
+Elternpakets gelesen ist. Was aufgelöst ist und nicht im Cache liegt, wird
+heruntergeladen, gegen den `sha256` aus `lyx.lock` geprüft und erst dann
+entpackt. Ein zweites `lpm install` ohne Änderung rechnet nicht neu.
+
+Offen in M2: `lpm search` und `lpm info` (Akzeptanzkriterien von PM-05) sowie
+die ETag-Revalidierung des Index-Spiegels samt 1-h-TTL — beides in
+`docs/registry.md` beschrieben, im Client noch nicht umgesetzt.
 
 Ursprünglich war eine Go-Implementierung für V1 mit späterem Port nach Lyx
 vorgesehen. Das Self-Hosting wurde vorgezogen — `lpm` ist von Beginn an in Lyx
@@ -294,6 +310,22 @@ geschrieben.
 ---
 
 ## Sicherheit
+
+Bereits umgesetzt:
+
+- SHA256 des Archivs wird gegen `lyx.lock` geprüft, **bevor** entpackt wird.
+  Stimmt er nicht, wird das Archiv gelöscht und nie ausgepackt
+- Der Download-Pfad wird aus Name und Version nach `docs/registry.md` gebildet,
+  **nicht** aus dem `source`-Feld des Index — ein manipulierter Index kann den
+  Download so nicht auf einen fremden Host umlenken
+- Paketnamen und Versionen werden auf Pfad-Traversal geprüft, bevor sie in einen
+  URL- oder Dateipfad gehen; ebenso jeder Pfad im tar-Archiv
+- `http://` als Registry wird abgelehnt statt still auf TLS hochgestuft
+
+Bekannter Trade-off: mit `std.net.https` kommt OpenSSL per FFI ins Binary, damit
+ist `lpm` dynamisch gelinkt und verliert RELRO — Sicherheits-Score 30/35 statt
+35/35 ohne Netzwerk. W^X, seccomp, landlock und Stack Canaries bleiben aktiv.
+Ein Rückweg zu RELRO hieße statisches `libssl` oder ein eigener TLS-Client.
 
 Geplant für PM-10:
 
@@ -311,12 +343,14 @@ Geplant für PM-10:
 
 ```bash
 make          # nach bin/lpm bauen
-make test     # Resolver-Tests bauen und ausführen
+make test     # Resolver-, Index- und Fetch-Tests bauen und ausführen
 make clean    # Binary entfernen
 ```
 
-`make test` braucht weder Netzwerk noch Schreibrechte und ist deshalb vom
-seccomp-Problem unten nicht betroffen.
+`make test` braucht weder Netzwerk noch Schreibrechte: die Fetch-Tests prüfen
+Namens-, Versions- und URL-Regeln, also genau die Entscheidungen, die *vor* dem
+ersten Byte auf der Leitung fallen. Der Transport selbst wird von Hand gegen die
+Registry geprüft (`lpm update`, `lpm install`).
 
 Beim Testen von `cache clean` empfiehlt sich ein separates `HOME`, damit der
 eigene Cache unangetastet bleibt:
@@ -328,27 +362,22 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
 
 ### Bekannte Fallstricke
 
-- **`std.fs` macht das Binary dynamisch gelinkt**
-  ([LyX-Compiler#1191](https://github.com/SEOLizer/LyX-Compiler/issues/1191)):
-  die Unit enthält ein `extern fn time(...) link "libc.so.6"`, das nur `MkTemp`
-  und `TmpFile` brauchen — die Referenz allein genügt aber. `lpm` ist deshalb
-  seit `lyxc` 1.0.13J nicht mehr statisch (193 KB → 240 KB), verliert RELRO und
-  landet bei 40/45 statt 45/45.
-- **HTTPS ist weiterhin nicht nutzbar** — aus zwei voneinander unabhängigen
-  Gründen, beide eingegrenzt und gemeldet:
-  - [#1192](https://github.com/SEOLizer/LyX-Compiler/issues/1192): `sys_sendto`
-    und `sys_recvfrom` bekommen im 4. Argument (`flags`) Müll statt `0`, sobald
-    sie aus einer Wrapper-Funktion aufgerufen werden. Damit scheitert jede
-    Namensauflösung über `std.net.dns`. Der Müllwert wechselt pro Lauf — mit
-    `MSG_DONTWAIT` gibt es sofort einen Fehler, ohne blockiert der Aufruf bis
-    zum Timeout. Das erklärt, warum das Symptom mal Hänger, mal Fehler war.
-  - [#1193](https://github.com/SEOLizer/LyX-Compiler/issues/1193): `setsockopt`
-    (54) fehlt im seccomp-Filter von `network.tcp.connect`. Mit fester IP kommt
-    der Verbindungsaufbau bis `TLSConnect` und stirbt dort, weil OpenSSL
-    `TCP_ULP` setzt.
-
-  Zwischenstand mit umgangenem DNS: TCP-Connect ✅, `TLSInit` ✅,
-  `TLSConnect` ✗.
+- **HTTPS braucht `network.udp.connect`** — und das ist kein Tippfehler: die
+  Namensauflösung vor jedem Request läuft über UDP. Der seccomp-Filter wird aus
+  den `@capabilities` abgeleitet, fehlt die UDP-Capability, stirbt der Prozess
+  direkt nach `socket(AF_INET, SOCK_DGRAM)` an SIGSYS — ohne Meldung, ohne
+  Rückgabewert. Die vollständige Liste für `std.net.https`:
+  `network.tcp.connect`, `network.udp.connect`, `memory.mmap`, `fs.read`,
+  `fs.meta`. `fs.meta` braucht OpenSSL für den CA-Store unter
+  `/usr/lib/ssl/certs`.
+- **Historisch, alle behoben:** `std.fs` zog früher über
+  `extern fn time ... link "libc.so.6"` einen Dynamiklink in jedes Programm
+  ([#1191](https://github.com/SEOLizer/LyX-Compiler/issues/1191)); `sys_sendto`
+  und `sys_recvfrom` bekamen im `flags`-Argument Müll
+  ([#1192](https://github.com/SEOLizer/LyX-Compiler/issues/1192)); `setsockopt`
+  fehlte im seccomp-Filter
+  ([#1193](https://github.com/SEOLizer/LyX-Compiler/issues/1193)), ebenso
+  `fcntl`, `poll` und `uname`. Seit `lyxc` 1.0.19E läuft HTTPS durch.
 - **`chmod` braucht seit `lyxc` 1.0.13J die Capability `fs.perm`** — ohne sie
   SIGSYS. `lpm` benutzt es nicht, aber die Regel gilt für jeden Konsumenten.
 - **`&&` schließt in `lyxc` nicht kurz.** `if p != null && deref(p)` wertet
