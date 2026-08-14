@@ -13,13 +13,14 @@
 @author("Andreas Röne")
 @copyright("2026 Andreas Röne")
 @capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.exit,
-               network.tcp.connect, network.udp.connect, memory.mmap])
+               network.tcp.connect, network.udp.connect, memory.mmap, system.time])
 unit main;
 
 import std.io grant [fs.read, fs.write];
 import lpm.core.cache grant [fs.read, fs.write, fs.create, fs.delete, fs.meta];
 import lpm.core.fetch grant [fs.read, fs.write, fs.create, fs.delete, fs.meta,
-                             network.tcp.connect, network.udp.connect, memory.mmap];
+                             network.tcp.connect, network.udp.connect, memory.mmap,
+                             system.time];
 
 var tsPass: int64 := 0;
 var tsFail: int64 := 0;

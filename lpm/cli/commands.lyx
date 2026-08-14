@@ -292,6 +292,12 @@ fn cmdSyncIndex(ctx: LpmCtx, home: pchar, name: pchar): bool {
   var rc: int64 := FtSyncPackageIndex(home, registry, name);
   if rc == FT_OK { return true; }
 
+  // FT_FRESH und FT_NOT_MOD heissen: der Spiegel gilt weiter. Ein erneuter
+  // Aufloesungsversuch faende dieselben Daten vor, deshalb false — der Aufrufer
+  // bricht damit die Schleife ab, statt sie leer zu drehen.
+  if rc == FT_FRESH  { return false; }
+  if rc == FT_NOT_MOD { return false; }
+
   // FT_ERR_404 heisst schlicht: das Paket gibt es nicht. Das meldet gleich
   // darauf der Resolver mit RS_ERR_MISSING, hier waere es doppelt.
   if rc != FT_ERR_404 {
@@ -759,7 +765,14 @@ fn lpmUpdate(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   var registry: pchar := ctx.lcRegistry;
   if registry == 0 as pchar { registry := arDefaultRegistry(); }
 
-  var rc: int64 := FtSyncRootIndex(home, registry);
+  // force: ein ausdrueckliches `lpm update` ignoriert die TTL, sonst taete es
+  // eine Stunde lang sichtbar nichts.
+  var rc: int64 := FtSyncRootIndex(home, registry, true);
+  if rc == FT_NOT_MOD {
+    cmdOut("lpm: Index von "c); cmdOut(registry);
+    cmdOutLn(" ist unveraendert."c);
+    return 0;
+  }
   if rc != FT_OK {
     cmdOut("lpm: error: "c); cmdOut(registry); cmdOut(": "c);
     cmdOutLn(FtErrStr(rc));
@@ -768,6 +781,226 @@ fn lpmUpdate(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
 
   cmdOut("lpm: Index von "c); cmdOut(registry);
   cmdOutLn(" aktualisiert."c);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// search / info — lesen den gespiegelten Gesamtindex
+// ---------------------------------------------------------------------------
+
+con CMD_JSON_MAX: int64 := 4194304;
+
+// Liest <regDir>/index.json in einen frisch allozierten Puffer.
+// *sizeOut bekommt die Puffergroesse (fuer das spaetere free), Rueckgabe ist
+// der Puffer oder 0.
+fn cmdReadRootIndex(home: pchar, sizeOut: int64): int64 {
+  var regDir: pchar := LpmCacheRegistryDir(home);
+  var path: int64 := alloc(CMD_NAME_MAX * 8);
+  var p: int64 := 0;
+  p := cmdWrS(path, p, regDir);
+  p := cmdWrS(path, p, "/index.json"c);
+  poke8(path + p, 0);
+  LpmCacheFreePath(regDir);
+
+  if !FileExists(path as pchar) { free(path, CMD_NAME_MAX * 8); return 0; }
+  var size: int64 := FileSize(path as pchar);
+  if size <= 0 { free(path, CMD_NAME_MAX * 8); return 0; }
+  if size > CMD_JSON_MAX { free(path, CMD_NAME_MAX * 8); return 0; }
+
+  var buf: int64 := alloc(size + 1);
+  var got: int64 := ReadFile(path as pchar, buf as pchar, size);
+  free(path, CMD_NAME_MAX * 8);
+  if got <= 0 { free(buf, size + 1); return 0; }
+  poke8(buf + got, 0);
+
+  poke64(sizeOut, size + 1);
+  return buf;
+}
+
+// Frischt den Spiegel des Gesamtindex auf, sofern nicht --offline.
+// Ein Fehler ist kein Abbruch: ein vorhandener Spiegel ist besser als nichts.
+fn cmdRefreshRootIndex(ctx: LpmCtx, home: pchar): void {
+  if ctx.lcOffline { return; }
+  var registry: pchar := ctx.lcRegistry;
+  if registry == 0 as pchar { registry := arDefaultRegistry(); }
+  // Kein force: search und info duerfen den Spiegel innerhalb der TTL nutzen,
+  // sonst kostet jede Suche einen Roundtrip.
+  var rc: int64 := FtSyncRootIndex(home, registry, false);
+  if rc < 0 {
+    if ctx.lcVerbose {
+      cmdOut("lpm: warning: Index nicht aktualisiert: "c);
+      cmdOutLn(FtErrStr(rc));
+    }
+  }
+}
+
+// Laedt den Gesamtindex in eine PkgList. Rueckgabe: false, wenn kein
+// brauchbarer Spiegel vorliegt (dann ist die Liste unveraendert).
+fn cmdLoadRootIndex(ctx: LpmCtx, home: pchar, list: PkgList): bool {
+  cmdRefreshRootIndex(ctx, home);
+
+  var sizeBox: int64 := alloc(8);
+  poke64(sizeBox, 0);
+  var buf: int64 := cmdReadRootIndex(home, sizeBox);
+  var size: int64 := peek64(sizeBox);
+  free(sizeBox, 8);
+
+  if buf == 0 {
+    cmdErr("kein Registry-Index vorhanden — 'lpm update' ausfuehren."c);
+    return false;
+  }
+
+  var rc: int64 := IxParseRootIndex(buf as pchar, list);
+  free(buf, size);
+
+  if rc < 0 {
+    cmdErr("Registry-Index ist beschaedigt — 'lpm update' ausfuehren."c);
+    return false;
+  }
+  return true;
+}
+
+// Enthaelt hay die Zeichenfolge needle? Kleinschreibung wird vorausgesetzt:
+// Paketnamen sind per Konvention klein, und die Suche soll nicht so tun, als
+// koennte sie mehr.
+fn cmdContains(hay: pchar, needle: pchar): bool {
+  if hay == 0 as pchar { return false; }
+  var hl: int64 := StrLen(hay);
+  var nl: int64 := StrLen(needle);
+  if nl == 0 { return true; }
+  if nl > hl { return false; }
+
+  var i: int64 := 0;
+  while i <= hl - nl {
+    var j: int64 := 0;
+    var same: bool := true;
+    while j < nl {
+      if peek8(hay as int64 + i + j) as int64 != peek8(needle as int64 + j) as int64 {
+        same := false;
+        break;
+      }
+      j := j + 1;
+    }
+    if same { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn lpmSearch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var query: pchar := ctx.LcSubArg(0);
+  if query == 0 as pchar {
+    cmdErr("search braucht einen Suchbegriff: lpm search <query>"c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  if home == 0 as pchar { cmdErr("HOME ist nicht gesetzt."c); return 1; }
+
+  var list: PkgList := new PkgList();
+  list.PlInit();
+  if !cmdLoadRootIndex(ctx, home, list) {
+    list.PlFree(); dispose list;
+    return 1;
+  }
+
+  var hits: int64 := 0;
+  var i: int64 := 0;
+  while i < list.PlCount() {
+    var nm: pchar := list.PlName(i);
+    if cmdContains(nm, query) || cmdContains(list.PlDesc(i), query) {
+      cmdOut("  "c); cmdOut(nm);
+      var lat: pchar := list.PlLatest(i);
+      if lat != 0 as pchar {
+        if peek8(lat as int64) as int64 != 0 { cmdOut("@"c); cmdOut(lat); }
+      }
+      var ds: pchar := list.PlDesc(i);
+      if ds != 0 as pchar {
+        if peek8(ds as int64) as int64 != 0 { cmdOut(" — "c); cmdOut(ds); }
+      }
+      cmdOutLn(""c);
+      hits := hits + 1;
+    }
+    i := i + 1;
+  }
+
+  if hits == 0 {
+    cmdOut("lpm: nichts gefunden fuer '"c); cmdOut(query); cmdOutLn("'."c);
+  } else {
+    cmdOut("lpm: "c); PrintInt(hits); cmdOutLn(" Treffer."c);
+  }
+
+  list.PlFree(); dispose list;
+  if hits == 0 { return 1; }
+  return 0;
+}
+
+fn lpmInfo(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var name: pchar := ctx.LcSubArg(0);
+  if name == 0 as pchar {
+    cmdErr("info braucht einen Paketnamen: lpm info <pkg>"c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  if home == 0 as pchar { cmdErr("HOME ist nicht gesetzt."c); return 1; }
+
+  // Beschreibung und latest stehen im Gesamtindex, die Versionsliste samt
+  // Dependencies nur im Paket-Index — deshalb beide Quellen.
+  var list: PkgList := new PkgList();
+  list.PlInit();
+  var haveRoot: bool := cmdLoadRootIndex(ctx, home, list);
+
+  cmdOut(name); cmdOutLn(""c);
+
+  if haveRoot {
+    var idx: int64 := list.PlFind(name);
+    if idx >= 0 {
+      var ds: pchar := list.PlDesc(idx);
+      if ds != 0 as pchar {
+        if peek8(ds as int64) as int64 != 0 { cmdOut("  "c); cmdOutLn(ds); }
+      }
+      var lat: pchar := list.PlLatest(idx);
+      if lat != 0 as pchar {
+        if peek8(lat as int64) as int64 != 0 {
+          cmdOut("  latest: "c); cmdOutLn(lat);
+        }
+      }
+    }
+  }
+  list.PlFree(); dispose list;
+
+  // Paket-Index holen und ueber den Katalog auswerten.
+  if !ctx.lcOffline { cmdSyncIndex(ctx, home, name); }
+
+  var cat: DepCatalog := new DepCatalog();
+  cat.DcInit();
+  var regDir: pchar := LpmCacheRegistryDir(home);
+  var n: int64 := LcFromIndexFile(regDir, name, cat);
+  LpmCacheFreePath(regDir);
+
+  if n <= 0 {
+    cmdOutLn("  (keine Versionen bekannt — Paket nicht in der Registry?)"c);
+    cat.DcFree(); dispose cat;
+    return 1;
+  }
+
+  cmdOutLn("  Versionen:"c);
+  var i: int64 := 0;
+  var shown: int64 := 0;
+  while i < cat.DcCount() {
+    if StrCmp(cat.DcName(i), name) == 0 {
+      var vr: pchar := cat.DcVer(i);
+      cmdOut("    "c); cmdOut(vr);
+      if LpmCacheHas(home, name, vr) { cmdOut("   (im Cache)"c); }
+      cmdOutLn(""c);
+      shown := shown + 1;
+    }
+    i := i + 1;
+  }
+
+  cmdOut("  "c); PrintInt(shown); cmdOutLn(" Version(en)."c);
+  cat.DcFree(); dispose cat;
   return 0;
 }
 
@@ -797,8 +1030,8 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if StrCmp(cmd, "install"c) == 0 { return lpmInstall(ctx, argc, argv); }
   if StrCmp(cmd, "remove"c)  == 0 { return lpmRemove(ctx, argc, argv); }
   if StrCmp(cmd, "update"c)  == 0 { return lpmUpdate(ctx, argc, argv); }
-  if StrCmp(cmd, "search"c)  == 0 { return lpmNotImpl("search"c); }
-  if StrCmp(cmd, "info"c)    == 0 { return lpmNotImpl("info"c); }
+  if StrCmp(cmd, "search"c)  == 0 { return lpmSearch(ctx, argc, argv); }
+  if StrCmp(cmd, "info"c)    == 0 { return lpmInfo(ctx, argc, argv); }
   if StrCmp(cmd, "list"c)    == 0 { return lpmList(argc, argv); }
   if StrCmp(cmd, "publish"c) == 0 { return lpmNotImpl("publish"c); }
   if StrCmp(cmd, "login"c)   == 0 { return lpmNotImpl("login"c); }

@@ -381,3 +381,189 @@ fn ixVersions(buf: int64, i: int64, name: pchar, cat: DepCatalog): int64 {
 
   return p;
 }
+
+// ---------------------------------------------------------------------------
+// /index.json  ->  PkgList  (Gesamtindex fuer `lpm search` und `lpm info`)
+// ---------------------------------------------------------------------------
+//
+// Der Gesamtindex fuehrt je Paket nur name, latest und description. Er ist die
+// Quelle fuer die Suche; Versionsliste und Dependencies stehen weiterhin nur im
+// Paket-Index, damit /index.json auch bei vielen Paketen klein bleibt.
+
+con IX_MAX_PKGS: int64 := 4096;
+
+pub type PkgList = class {
+  plNames: int64;
+  plLatest: int64;
+  plDescs: int64;
+  plN: int64;
+
+  pub fn PlInit(): void {
+    self.plNames  := alloc(IX_MAX_PKGS * 8);
+    self.plLatest := alloc(IX_MAX_PKGS * 8);
+    self.plDescs  := alloc(IX_MAX_PKGS * 8);
+    self.plN := 0;
+  }
+
+  pub fn PlFree(): void {
+    var i: int64 := 0;
+    while i < self.plN {
+      free(peek64(self.plNames  + i * 8), IX_STR_MAX);
+      free(peek64(self.plLatest + i * 8), IX_STR_MAX);
+      free(peek64(self.plDescs  + i * 8), IX_STR_MAX);
+      i := i + 1;
+    }
+    free(self.plNames,  IX_MAX_PKGS * 8);
+    free(self.plLatest, IX_MAX_PKGS * 8);
+    free(self.plDescs,  IX_MAX_PKGS * 8);
+    self.plN := 0;
+  }
+
+  // Uebernimmt die drei Puffer (kein Kopieren) und wird damit ihr Eigentuemer.
+  // Rueckgabe: false, wenn die Liste voll ist — dann bleiben sie beim Aufrufer.
+  pub fn PlAdd(name: int64, latest: int64, desc: int64): bool {
+    if self.plN >= IX_MAX_PKGS { return false; }
+    poke64(self.plNames  + self.plN * 8, name);
+    poke64(self.plLatest + self.plN * 8, latest);
+    poke64(self.plDescs  + self.plN * 8, desc);
+    self.plN := self.plN + 1;
+    return true;
+  }
+
+  pub fn PlCount(): int64 { return self.plN; }
+  pub fn PlName(i: int64): pchar   { return peek64(self.plNames  + i * 8) as pchar; }
+  pub fn PlLatest(i: int64): pchar { return peek64(self.plLatest + i * 8) as pchar; }
+  pub fn PlDesc(i: int64): pchar   { return peek64(self.plDescs  + i * 8) as pchar; }
+
+  // Index des Pakets mit genau diesem Namen, oder -1.
+  pub fn PlFind(name: pchar): int64 {
+    var i: int64 := 0;
+    while i < self.plN {
+      if StrCmp(self.PlName(i), name) == 0 { return i; }
+      i := i + 1;
+    }
+    return 0 - 1;
+  }
+};
+
+// Liest ein Element des packages-Arrays. Rueckgabe: Position danach, oder -1.
+fn ixPkgEntry(buf: int64, i: int64, list: PkgList): int64 {
+  var p: int64 := ixExpect(buf, i, 123);
+  if p < 0 { return 0 - 1; }
+
+  var name:   int64 := alloc(IX_STR_MAX);
+  var latest: int64 := alloc(IX_STR_MAX);
+  var desc:   int64 := alloc(IX_STR_MAX);
+  poke8(name, 0); poke8(latest, 0); poke8(desc, 0);
+
+  p := ixWs(buf, p);
+  if peek8(buf + p) as int64 != 125 {
+    while true {
+      p := ixWs(buf, p);
+      var key: int64 := alloc(IX_STR_MAX);
+      p := ixString(buf, p, key, IX_STR_MAX);
+      if p < 0 { free(key, IX_STR_MAX); break; }
+      p := ixExpect(buf, p, 58);
+      if p < 0 { free(key, IX_STR_MAX); break; }
+
+      var isName: bool := StrCmp(key as pchar, "name"c) == 0;
+      var isLat:  bool := StrCmp(key as pchar, "latest"c) == 0;
+      var isDesc: bool := StrCmp(key as pchar, "description"c) == 0;
+      free(key, IX_STR_MAX);
+
+      p := ixWs(buf, p);
+      if isName {
+        p := ixString(buf, p, name, IX_STR_MAX);
+      } else if isLat {
+        p := ixString(buf, p, latest, IX_STR_MAX);
+      } else if isDesc {
+        p := ixString(buf, p, desc, IX_STR_MAX);
+      } else {
+        // versions-Array und alles Unbekannte wird ueberlesen.
+        p := ixSkipValue(buf, p);
+      }
+      if p < 0 { break; }
+
+      p := ixWs(buf, p);
+      var c: int64 := peek8(buf + p) as int64;
+      if c == 44 { p := p + 1; }
+      else if c == 125 { p := p + 1; break; }
+      else { p := 0 - 1; break; }
+    }
+  } else {
+    p := p + 1;
+  }
+
+  if p < 0 {
+    free(name, IX_STR_MAX); free(latest, IX_STR_MAX); free(desc, IX_STR_MAX);
+    return 0 - 1;
+  }
+
+  // Ein Eintrag ohne Namen ist wertlos — er waere weder such- noch auffindbar.
+  if peek8(name) as int64 == 0 {
+    free(name, IX_STR_MAX); free(latest, IX_STR_MAX); free(desc, IX_STR_MAX);
+    return p;
+  }
+
+  if !list.PlAdd(name, latest, desc) {
+    free(name, IX_STR_MAX); free(latest, IX_STR_MAX); free(desc, IX_STR_MAX);
+  }
+  return p;
+}
+
+// Parst /index.json in eine PkgList.
+// Rueckgabe: Anzahl aufgenommener Pakete, oder IX_ERR_SYNTAX.
+pub fn IxParseRootIndex(json: pchar, list: PkgList): int64 {
+  var buf: int64 := json as int64;
+  var p: int64 := ixExpect(buf, 0, 123);
+  if p < 0 { return IX_ERR_SYNTAX; }
+
+  var sawPackages: bool := false;
+
+  p := ixWs(buf, p);
+  if peek8(buf + p) as int64 == 125 { return IX_ERR_SYNTAX; }
+
+  while true {
+    p := ixWs(buf, p);
+    var key: int64 := alloc(IX_STR_MAX);
+    p := ixString(buf, p, key, IX_STR_MAX);
+    if p < 0 { free(key, IX_STR_MAX); return IX_ERR_SYNTAX; }
+    p := ixExpect(buf, p, 58);
+    if p < 0 { free(key, IX_STR_MAX); return IX_ERR_SYNTAX; }
+
+    var isPkgs: bool := StrCmp(key as pchar, "packages"c) == 0;
+    free(key, IX_STR_MAX);
+
+    if isPkgs {
+      sawPackages := true;
+      p := ixExpect(buf, p, 91);
+      if p < 0 { return IX_ERR_SYNTAX; }
+      p := ixWs(buf, p);
+      if peek8(buf + p) as int64 == 93 {
+        p := p + 1;
+      } else {
+        while true {
+          p := ixPkgEntry(buf, p, list);
+          if p < 0 { return IX_ERR_SYNTAX; }
+          p := ixWs(buf, p);
+          var c2: int64 := peek8(buf + p) as int64;
+          if c2 == 44 { p := p + 1; }
+          else if c2 == 93 { p := p + 1; break; }
+          else { return IX_ERR_SYNTAX; }
+        }
+      }
+    } else {
+      p := ixSkipValue(buf, p);
+      if p < 0 { return IX_ERR_SYNTAX; }
+    }
+
+    p := ixWs(buf, p);
+    var c: int64 := peek8(buf + p) as int64;
+    if c == 44 { p := p + 1; }
+    else if c == 125 { break; }
+    else { return IX_ERR_SYNTAX; }
+  }
+
+  if !sawPackages { return IX_ERR_SYNTAX; }
+  return list.PlCount();
+}

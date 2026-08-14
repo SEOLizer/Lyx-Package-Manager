@@ -25,10 +25,13 @@ unit lpm.core.fetch;
 
 import std.io;
 import std.fs;
+import std.time;
 import std.net.https;
 import lpm.core.cache;
 
 pub con FT_OK:        int64 := 0;
+pub con FT_FRESH:     int64 := 1;   // Spiegel ist aktuell, kein Request noetig
+pub con FT_NOT_MOD:   int64 := 2;   // Server meldet 304, Spiegel bleibt gueltig
 pub con FT_ERR_URL:   int64 := 0 - 1;   // Registry-URL nicht verwertbar
 pub con FT_ERR_NET:   int64 := 0 - 2;   // kein Ergebnis vom Server
 pub con FT_ERR_404:   int64 := 0 - 3;   // Paket bzw. Index existiert nicht
@@ -42,6 +45,8 @@ con FT_BODY_MAX: int64 := 4194304;      // 4 MiB — Grenze fuer einen Index
 con FT_ARCHIVE_MAX: int64 := 67108864;  // 64 MiB — Grenze fuer ein .lxpkg,
                                         // gleich der Entpack-Grenze in archive.lyx
 con FT_DIR_MODE: int64 := 493;       // 0755
+con FT_ETAG_MAX: int64 := 256;
+con FT_TTL_SECS: int64 := 3600;      // 1 h, siehe docs/registry.md
 
 // ---------------------------------------------------------------------------
 // Pfad-Helfer (bewusst dieselbe Form wie in cache.lyx und localcat.lyx)
@@ -118,6 +123,152 @@ fn ftUrlOk(registry: pchar): bool {
 }
 
 // ---------------------------------------------------------------------------
+// ETag und TTL
+// ---------------------------------------------------------------------------
+//
+// Neben jeder gespiegelten Datei liegt eine <pfad>.meta mit dem ETag der
+// Antwort. Ihre eigene mtime ist der Zeitstempel des letzten erfolgreichen
+// Abgleichs — auch bei 304, wo die Nutzdatei unveraendert bleibt. Damit misst
+// die TTL, wann zuletzt *nachgefragt* wurde, nicht wann sich zuletzt etwas
+// geaendert hat. Genau das ist gemeint.
+
+// Schreibt "<pfad>.meta" nach dst (eigener Puffer der Groesse FT_PATH_MAX).
+fn ftMetaPath(path: int64, dst: int64): void {
+  var p: int64 := 0;
+  p := ftAppend(dst, p, path as pchar);
+  p := ftAppend(dst, p, ".meta"c);
+  ftEnd(dst, p);
+}
+
+// Kleinbuchstabe eines ASCII-Zeichens.
+fn ftLower(c: int64): int64 {
+  if c >= 65 { if c <= 90 { return c + 32; } }
+  return c;
+}
+
+// Sucht "ETag:" in einem rohen Header-Block und legt den Wert in etagOut ab
+// (inklusive der Anfuehrungszeichen — genau so muss er in If-None-Match
+// zurueckgehen, W/-Praefix eingeschlossen).
+fn ftEtagFromHeaders(headers: int64, etagOut: int64): void {
+  poke8(etagOut, 0);
+  if headers == 0 { return; }
+
+  var key: pchar := "etag:"c;
+  var klen: int64 := StrLen(key);
+  var i: int64 := 0;
+  var atLineStart: bool := true;
+
+  while true {
+    var c: int64 := peek8(headers + i) as int64;
+    if c == 0 { return; }
+
+    if atLineStart {
+      var j: int64 := 0;
+      var isEtag: bool := true;
+      while j < klen {
+        var h: int64 := peek8(headers + i + j) as int64;
+        if h == 0 { return; }
+        if ftLower(h) != peek8(key as int64 + j) as int64 { isEtag := false; break; }
+        j := j + 1;
+      }
+      if isEtag {
+        var p: int64 := i + klen;
+        while peek8(headers + p) as int64 == 32 { p := p + 1; }
+        var n: int64 := 0;
+        while true {
+          var v: int64 := peek8(headers + p) as int64;
+          if v == 0 { break; }
+          if v == 13 { break; }
+          if v == 10 { break; }
+          if n < FT_ETAG_MAX - 1 {
+            poke8(etagOut + n, v as int8);
+            n := n + 1;
+          }
+          p := p + 1;
+        }
+        poke8(etagOut + n, 0);
+        return;
+      }
+    }
+
+    if c == 10 { atLineStart := true; } else { atLineStart := false; }
+    i := i + 1;
+  }
+}
+
+// Liest den gespeicherten ETag zu path. Rueckgabe: true, wenn einer vorlag.
+fn ftEtagLoad(path: int64, etagOut: int64): bool {
+  poke8(etagOut, 0);
+  var meta: int64 := alloc(FT_PATH_MAX);
+  ftMetaPath(path, meta);
+
+  var ok: bool := false;
+  if FileExists(meta as pchar) {
+    var size: int64 := FileSize(meta as pchar);
+    if size > 0 {
+      if size < FT_ETAG_MAX {
+        var got: int64 := ReadFile(meta as pchar, etagOut as pchar, size);
+        if got > 0 {
+          poke8(etagOut + got, 0);
+          ok := true;
+        }
+      }
+    }
+  }
+  free(meta, FT_PATH_MAX);
+  return ok;
+}
+
+// Schreibt den ETag neben die Datei und frischt damit den Zeitstempel auf.
+// Ein leerer ETag ist zulaessig: dann zaehlt nur noch die TTL.
+fn ftEtagStore(path: int64, etag: int64): void {
+  var meta: int64 := alloc(FT_PATH_MAX);
+  ftMetaPath(path, meta);
+  var len: int64 := 0;
+  if etag != 0 { len := StrLen(etag as pchar); }
+  WriteFile(meta as pchar, etag as pchar, len);
+  free(meta, FT_PATH_MAX);
+}
+
+// mtime einer Datei in Unix-Sekunden, 0 bei Fehler.
+//
+// Bewusst nicht std.fs.FileModTime: das liest st_mtime bei Offset 80 des
+// stat-Puffers, dort steht auf x86_64 aber st_atime_nsec — der Rueckgabewert ist
+// 0 oder Rauschen, nie die mtime. Richtig ist Offset 88 (gemessen: st_atime 72,
+// st_mtime 88, st_ctime 104). Gemeldet als stdlib-Bug; bis zum Fix rechnet lpm
+// selbst, sonst laeuft die TTL nie ab.
+con FT_STAT_BUF:   int64 := 144;
+con FT_STAT_MTIME: int64 := 88;
+
+fn ftFileMTime(path: pchar): int64 {
+  var buf: int64 := alloc(FT_STAT_BUF);
+  if !FileStat(path, buf) {
+    free(buf, FT_STAT_BUF);
+    return 0;
+  }
+  var t: int64 := peek64(buf + FT_STAT_MTIME);
+  free(buf, FT_STAT_BUF);
+  return t;
+}
+
+// Ist der Spiegel juenger als die TTL? Dann wird gar nicht erst gefragt.
+// Fehlt die Nutzdatei oder die .meta, gilt er als abgelaufen.
+fn ftIsFresh(path: int64): bool {
+  if !FileExists(path as pchar) { return false; }
+
+  var meta: int64 := alloc(FT_PATH_MAX);
+  ftMetaPath(path, meta);
+  var stamp: int64 := 0;
+  if FileExists(meta as pchar) { stamp := ftFileMTime(meta as pchar); }
+  free(meta, FT_PATH_MAX);
+  if stamp <= 0 { return false; }
+
+  var now: int64 := Now() as int64;
+  if now < stamp { return false; }   // Uhr zurueckgestellt — lieber nachfragen
+  return now - stamp < FT_TTL_SECS;
+}
+
+// ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
@@ -125,15 +276,45 @@ fn ftUrlOk(registry: pchar): bool {
 // nullterminierten Puffer ab. *outBuf/*outLen sind Zeiger auf int64-Slots.
 // Rueckgabe: FT_OK oder ein FT_ERR_*-Code. Bei allem ausser FT_OK bleibt
 // *outBuf 0.
-fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64, maxLen: int64): int64 {
+fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64, maxLen: int64,
+         etagIn: pchar, etagOut: int64): int64 {
   poke64(outBuf, 0);
   poke64(outLen, 0);
+  if etagOut != 0 { poke8(etagOut, 0); }
 
-  var resp: HTTPResponse := HTTPSGet(host as int64, path as int64);
+  var resp: HTTPResponse;
+  if etagIn == 0 as pchar {
+    resp := HTTPSGet(host as int64, path as int64);
+  } else {
+    // Header-Block fuer HTTPSSend: eigene Zeile, mit CRLF abgeschlossen.
+    var hdr: int64 := alloc(FT_ETAG_MAX + 32);
+    var hp: int64 := 0;
+    hp := ftAppend(hdr, hp, "If-None-Match: "c);
+    hp := ftAppend(hdr, hp, etagIn);
+    poke8(hdr + hp, 13); hp := hp + 1;
+    poke8(hdr + hp, 10); hp := hp + 1;
+    ftEnd(hdr, hp);
+
+    var req: HTTPRequest;
+    req.method   := HTTP_GET;
+    req.host     := host as int64;
+    req.path     := path as int64;
+    req.port     := 443;
+    req.headers  := hdr;
+    req.body     := 0;
+    req.bodySize := 0;
+
+    resp := HTTPSSend(req);
+    free(hdr, FT_ETAG_MAX + 32);
+  }
 
   if resp.statusCode == 0 {
     HTTPResponseFree(resp);
     return FT_ERR_NET;
+  }
+  if resp.statusCode == 304 {
+    HTTPResponseFree(resp);
+    return FT_NOT_MOD;
   }
   if resp.statusCode == 404 {
     HTTPResponseFree(resp);
@@ -158,6 +339,14 @@ fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64, maxLen: int64):
   var buf: int64 := alloc(size + 1);
   memcpy(buf, resp.bodyPtr, size);
   poke8(buf + size, 0);
+  // ETag-Extraktion ist hier bewusst NICHT verdrahtet: std.net.https fuellt
+  // resp.headersRaw nicht — das Feld wird in HTTPSGet/HTTPSSend nie gesetzt und
+  // enthaelt einen undefinierten Wert (LyX-Compiler-Issue, siehe README).
+  // ftEtagFromHeaders daran zu haengen hiesse, einen Zufallszeiger zu lesen.
+  // Sobald der HTTPS-Client die Header liefert, genuegt hier eine Zeile:
+  //   if etagOut != 0 { ftEtagFromHeaders(resp.headersRaw, etagOut); }
+  // Bis dahin traegt die TTL die Revalidierung allein; .meta bleibt leer und
+  // dient nur als Zeitstempel.
   HTTPResponseFree(resp);
 
   poke64(outBuf, buf);
@@ -226,7 +415,7 @@ fn ftWriteAtomic(path: int64, buf: int64, len: int64): bool {
 
 // Holt <registry><basePath><relPath> und spiegelt das Ergebnis nach
 // <regDir><relPath>.
-fn ftMirror(registry: pchar, regDir: pchar, relPath: pchar): int64 {
+fn ftMirror(registry: pchar, regDir: pchar, relPath: pchar, force: bool): int64 {
   var host: int64 := alloc(FT_HOST_MAX);
   var baseOff: int64 := ftSplitUrl(registry, host);
   if baseOff < 0 {
@@ -234,20 +423,60 @@ fn ftMirror(registry: pchar, regDir: pchar, relPath: pchar): int64 {
     return FT_ERR_URL;
   }
 
+  var dst: int64 := alloc(FT_PATH_MAX);
+  var p: int64 := 0;
+  p := ftAppend(dst, p, regDir);
+  p := ftAppend(dst, p, relPath);
+  ftEnd(dst, p);
+
+  // Innerhalb der TTL wird gar nicht gefragt — ausser der Aufrufer besteht
+  // darauf (`lpm update` soll spuerbar etwas tun).
+  if !force && ftIsFresh(dst) {
+    free(dst, FT_PATH_MAX);
+    free(host, FT_HOST_MAX);
+    return FT_FRESH;
+  }
+
+  // Danach: fragen, aber mit dem bekannten ETag — der Server darf mit 304
+  // antworten und spart den Rumpf.
+  var etagIn: int64 := alloc(FT_ETAG_MAX);
+  var haveEtag: bool := ftEtagLoad(dst, etagIn);
+  if !FileExists(dst as pchar) { haveEtag := false; }
+  var etagPtr: pchar := 0 as pchar;
+  if haveEtag { etagPtr := etagIn as pchar; }
+
   // Anfragepfad = Basispfad der Registry-URL + relPath.
   var req: int64 := alloc(FT_PATH_MAX);
-  var p: int64 := 0;
+  p := 0;
   p := ftAppend(req, p, (registry as int64 + baseOff) as pchar);
   p := ftAppend(req, p, relPath);
   ftEnd(req, p);
 
+  var etagOut: int64 := alloc(FT_ETAG_MAX);
   var bodySlot: int64 := alloc(16);
-  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8, FT_BODY_MAX);
+  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8,
+                         FT_BODY_MAX, etagPtr, etagOut);
   free(req, FT_PATH_MAX);
   free(host, FT_HOST_MAX);
+  free(etagIn, FT_ETAG_MAX);
+
+  if rc == FT_NOT_MOD {
+    // Unveraendert: nur den Zeitstempel auffrischen, damit die TTL wieder
+    // laeuft. Der ETag bleibt, was er war.
+    var keep: int64 := alloc(FT_ETAG_MAX);
+    ftEtagLoad(dst, keep);
+    ftEtagStore(dst, keep);
+    free(keep, FT_ETAG_MAX);
+    free(etagOut, FT_ETAG_MAX);
+    free(bodySlot, 16);
+    free(dst, FT_PATH_MAX);
+    return FT_NOT_MOD;
+  }
 
   if rc != FT_OK {
+    free(etagOut, FT_ETAG_MAX);
     free(bodySlot, 16);
+    free(dst, FT_PATH_MAX);
     return rc;
   }
 
@@ -255,15 +484,12 @@ fn ftMirror(registry: pchar, regDir: pchar, relPath: pchar): int64 {
   var len: int64 := peek64(bodySlot + 8);
   free(bodySlot, 16);
 
-  var dst: int64 := alloc(FT_PATH_MAX);
-  p := 0;
-  p := ftAppend(dst, p, regDir);
-  p := ftAppend(dst, p, relPath);
-  ftEnd(dst, p);
-
   var ok: bool := ftWriteAtomic(dst, body, len);
-  free(dst, FT_PATH_MAX);
   FtFreeBody(body, len);
+  if ok { ftEtagStore(dst, etagOut); }
+
+  free(etagOut, FT_ETAG_MAX);
+  free(dst, FT_PATH_MAX);
 
   if !ok { return FT_ERR_WRITE; }
   return FT_OK;
@@ -285,7 +511,7 @@ pub fn FtSyncPackageIndex(home: pchar, registry: pchar, name: pchar): int64 {
   ftEnd(rel, p);
 
   var regDir: pchar := LpmCacheRegistryDir(home);
-  var rc: int64 := ftMirror(registry, regDir, rel as pchar);
+  var rc: int64 := ftMirror(registry, regDir, rel as pchar, false);
   LpmCacheFreePath(regDir);
   free(rel, FT_PATH_MAX);
   return rc;
@@ -325,7 +551,8 @@ pub fn FtDownloadArchive(home: pchar, registry: pchar, name: pchar,
   ftEnd(req, p);
 
   var bodySlot: int64 := alloc(16);
-  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8, FT_ARCHIVE_MAX);
+  var rc: int64 := ftGet(host as pchar, req as pchar, bodySlot, bodySlot + 8,
+                         FT_ARCHIVE_MAX, 0 as pchar, 0);
   free(req, FT_PATH_MAX);
   free(host, FT_HOST_MAX);
 
@@ -404,12 +631,12 @@ pub fn FtVersionIsSafe(version: pchar): bool {
 }
 
 // Spiegelt /index.json (Gesamtindex fuer `lpm search`).
-pub fn FtSyncRootIndex(home: pchar, registry: pchar): int64 {
+pub fn FtSyncRootIndex(home: pchar, registry: pchar, force: bool): int64 {
   if !ftUrlOk(registry) { return FT_ERR_URL; }
   if !LpmCacheEnsure(home) { return FT_ERR_WRITE; }
 
   var regDir: pchar := LpmCacheRegistryDir(home);
-  var rc: int64 := ftMirror(registry, regDir, "/index.json"c);
+  var rc: int64 := ftMirror(registry, regDir, "/index.json"c, force);
   LpmCacheFreePath(regDir);
   return rc;
 }
@@ -460,6 +687,8 @@ pub fn FtNameIsSafe(name: pchar): bool {
 // Klartext zu einem FT_ERR_*-Code.
 pub fn FtErrStr(code: int64): pchar {
   if code == FT_OK         { return "ok"c; }
+  if code == FT_FRESH      { return "Spiegel ist noch aktuell (TTL)"c; }
+  if code == FT_NOT_MOD    { return "unveraendert (304)"c; }
   if code == FT_ERR_URL    { return "Registry-URL nicht verwertbar (erwartet https://host)"c; }
   if code == FT_ERR_NET    { return "keine Antwort von der Registry"c; }
   if code == FT_ERR_404    { return "in der Registry nicht gefunden"c; }

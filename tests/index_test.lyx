@@ -163,6 +163,72 @@ fn testEmptyVersions(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Gesamtindex /index.json -> PkgList (Quelle fuer search und info)
+// ---------------------------------------------------------------------------
+
+fn testRootIndex(): void {
+  outLn("Gesamtindex"c);
+  var pl: PkgList := new PkgList();
+  pl.PlInit();
+  var n: int64 := IxParseRootIndex(
+    "{\"generated\":\"2026-08-14T18:00:00Z\",\"packages\":[{\"name\":\"net/http\",\"latest\":\"1.3.0\",\"description\":\"HTTP client\",\"versions\":[\"1.2.0\",\"1.3.0\"]},{\"name\":\"buffer\",\"latest\":\"2.1.3\",\"description\":\"Byte buffers\"}]}"c,
+    pl);
+  okInt("zwei Pakete"c, n, 2);
+  okStr("erster Name"c, pl.PlName(0), "net/http"c);
+  okStr("latest"c, pl.PlLatest(0), "1.3.0"c);
+  okStr("description"c, pl.PlDesc(0), "HTTP client"c);
+  okStr("zweiter Name"c, pl.PlName(1), "buffer"c);
+  okInt("PlFind trifft"c, pl.PlFind("buffer"c), 1);
+  okInt("PlFind daneben"c, pl.PlFind("net/https"c), 0 - 1);
+  pl.PlFree(); dispose pl;
+}
+
+fn testRootIndexRobust(): void {
+  outLn("Gesamtindex, Sonderfaelle"c);
+
+  var a: PkgList := new PkgList();
+  a.PlInit();
+  okInt("leeres packages-Array"c,
+        IxParseRootIndex("{\"packages\":[]}"c, a), 0);
+  a.PlFree(); dispose a;
+
+  var b: PkgList := new PkgList();
+  b.PlInit();
+  okInt("packages fehlt"c,
+        IxParseRootIndex("{\"generated\":\"x\"}"c, b), IX_ERR_SYNTAX);
+  b.PlFree(); dispose b;
+
+  var c: PkgList := new PkgList();
+  c.PlInit();
+  okInt("abgeschnitten"c,
+        IxParseRootIndex("{\"packages\":[{\"name\":\"a\""c, c), IX_ERR_SYNTAX);
+  c.PlFree(); dispose c;
+
+  var d: PkgList := new PkgList();
+  d.PlInit();
+  okInt("kein Objekt"c, IxParseRootIndex("[]"c, d), IX_ERR_SYNTAX);
+  d.PlFree(); dispose d;
+
+  // Ein Eintrag ohne name ist weder such- noch auffindbar und wird verworfen,
+  // ohne den Rest des Index mitzureissen.
+  var e: PkgList := new PkgList();
+  e.PlInit();
+  okInt("Eintrag ohne name faellt raus"c,
+        IxParseRootIndex("{\"packages\":[{\"latest\":\"1.0.0\"},{\"name\":\"ok\"}]}"c, e), 1);
+  okStr("der gueltige bleibt"c, e.PlName(0), "ok"c);
+  e.PlFree(); dispose e;
+
+  // Unbekannte Schluessel muessen ueberlesen werden, sonst bricht ein spaeter
+  // erweiterter Index aeltere lpm-Versionen.
+  var f: PkgList := new PkgList();
+  f.PlInit();
+  okInt("unbekannte Schluessel"c,
+        IxParseRootIndex("{\"schema\":2,\"packages\":[{\"name\":\"a\",\"stars\":42,\"tags\":[\"x\"]}],\"extra\":{\"y\":1}}"c, f), 1);
+  okStr("Name trotzdem gelesen"c, f.PlName(0), "a"c);
+  f.PlFree(); dispose f;
+}
+
+// ---------------------------------------------------------------------------
 // 6. Parser + Resolver zusammen: Index -> Katalog -> Aufloesung
 // ---------------------------------------------------------------------------
 
@@ -208,6 +274,8 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testWrongName();
   testBroken();
   testEmptyVersions();
+  testRootIndex();
+  testRootIndexRobust();
   testEndToEnd();
 
   outLn(""c);

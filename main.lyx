@@ -9,12 +9,12 @@
 // socket(AF_INET, SOCK_DGRAM) nicht und der Prozess stirbt wortlos an SIGSYS.
 // fs.meta braucht OpenSSL fuer den CA-Store unter /usr/lib/ssl/certs.
 @capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit,
-               network.tcp.connect, network.udp.connect, memory.mmap])
+               network.tcp.connect, network.udp.connect, memory.mmap, system.time])
 unit main;
 
 import std.io grant [fs.read, fs.write];
 import lpm.cli.commands grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, system.env, system.exit,
-                               network.tcp.connect, network.udp.connect, memory.mmap];
+                               network.tcp.connect, network.udp.connect, memory.mmap, system.time];
 
 pub fn main(argc: int64, argv: pchar): int64 {
   return lpmMain(argc, argv);
