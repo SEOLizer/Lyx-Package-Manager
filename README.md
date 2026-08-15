@@ -255,7 +255,9 @@ lyx-lpm/
   tests/
     resolver_test.lyx      Resolver-Tests (ohne Netz und Dateisystem)
     index_test.lyx         Parser-Tests
-    fetch_test.lyx         Namens-, Versions- und URL-Regeln des Transports
+    fetch_test.lyx         Namens-, Versions- und URL-Regeln, Upload-Vorprüfungen
+    pack_test.lyx          Reproduzierbarkeit, Archivinhalt, Ausschlüsse
+    credentials_test.lyx   Token-Ablage, Rechte, mehrere Registries
 ```
 
 ### Grenzen des Resolvers
@@ -413,10 +415,18 @@ make test     # Resolver-, Index- und Fetch-Tests bauen und ausführen
 make clean    # Binary entfernen
 ```
 
-`make test` braucht weder Netzwerk noch Schreibrechte: die Fetch-Tests prüfen
+`make test` läuft ohne Netzwerk — 202 Fälle in fünf Suiten. Geprüft wird alles,
+was sich ohne Gegenstelle entscheiden lässt: Auflösung, Index-Parser, sowie
 Namens-, Versions- und URL-Regeln, also genau die Entscheidungen, die *vor* dem
-ersten Byte auf der Leitung fallen. Der Transport selbst wird von Hand gegen die
-Registry geprüft (`lpm update`, `lpm install`).
+ersten Byte auf der Leitung fallen.
+
+`pack_test` und `credentials_test` brauchen als einzige das Dateisystem. Sie
+arbeiten unter `tests-tmp/` bzw. `tests-tmp-cred/` im Arbeitsverzeichnis und
+räumen selbst auf; die Credentials-Suite benutzt ein eigenes `HOME`, damit sie
+die echten Zugangsdaten nie anfasst.
+
+Der Transport selbst und `publish` hängen an einer erreichbaren Registry und
+werden von Hand geprüft (`lpm update`, `lpm install`, `lpm publish`).
 
 Beim Testen von `cache clean` empfiehlt sich ein separates `HOME`, damit der
 eigene Cache unangetastet bleibt:
