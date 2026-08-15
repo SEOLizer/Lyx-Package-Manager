@@ -425,6 +425,11 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
   `network.tcp.connect`, `network.udp.connect`, `memory.mmap`, `fs.read`,
   `fs.meta`. `fs.meta` braucht OpenSSL für den CA-Store unter
   `/usr/lib/ssl/certs`.
+- **`std.net.https` löst `Transfer-Encoding: chunked` nicht auf**
+  ([#1539](https://github.com/SEOLizer/LyX-Compiler/issues/1539)): der Rumpf
+  kommt mit Chunk-Rahmen durchsetzt an, sobald der Server chunked sendet — bei
+  Cloudflare größenabhängig. `lpm` löst das selbst auf (`ftDechunk`), erkannt an
+  der Form statt am Header, weil `headersRaw` fehlt (siehe unten).
 - **`std.net.https` liefert keine Response-Header**
   ([#1534](https://github.com/SEOLizer/LyX-Compiler/issues/1534)): `headersRaw`
   und `headersSize` werden nie gesetzt — es gibt also keine Quelle für den
