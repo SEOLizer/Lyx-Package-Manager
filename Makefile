@@ -13,6 +13,7 @@ SRCS := main.lyx \
         lpm/core/index.lyx \
         lpm/core/localcat.lyx \
         lpm/core/fetch.lyx \
+        lpm/core/pack.lyx \
         lpm/cli/args.lyx \
         lpm/cli/commands.lyx
 

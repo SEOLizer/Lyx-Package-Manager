@@ -1,0 +1,439 @@
+// lpm/core/pack.lyx
+// WP-PM-08 (Vorstufe): aus einem Projektverzeichnis ein .lxpkg bauen.
+//
+// Ohne dieses Modul liesse sich ein Paket nur von Hand mit tar und zstd
+// erzeugen — und dabei ist genau eine Sache leicht falsch zu machen, die
+// hinterher niemand sieht: die Reihenfolge und die Zeitstempel. Ein .lxpkg soll
+// reproduzierbar sein, damit zwei Baeufe derselben Quellen denselben SHA256
+// ergeben und der Lock-Eintrag etwas bedeutet.
+//
+// Reproduzierbar heisst hier konkret:
+//   * Dateien werden nach Namen sortiert aufgenommen, nicht in der Reihenfolge,
+//     in der das Dateisystem sie ausspuckt.
+//   * mtime und Modus kommen aus std.tar fest (0 bzw. 0644) — das Archiv traegt
+//     also keinen Zeitpunkt und keine lokalen Rechte.
+//   * FILES.sha256 wird aus denselben sortierten Daten erzeugt.
+//
+// Nicht aufgenommen werden: versteckte Dateien, lyx.lock (gehoert zum
+// Anwender, nicht zum Paket), bin/, das Archiv selbst und alles, was nicht
+// Datei oder Verzeichnis ist.
+
+@description("lpm package builder (.lxpkg)")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+unit lpm.core.pack;
+
+import std.io;
+import std.fs;
+import std.tar;
+import std.zstd;
+import std.crypto.sha256;
+import lpm.core.dirent;
+import lpm.core.manifest;
+
+pub con PK_OK:          int64 := 0;
+pub con PK_ERR_NOTOML:  int64 := 0 - 1;   // kein lyx.toml im Verzeichnis
+pub con PK_ERR_MANIFEST:int64 := 0 - 2;   // lyx.toml unlesbar oder unvollstaendig
+pub con PK_ERR_EMPTY:   int64 := 0 - 3;   // keine Datei zum Einpacken
+pub con PK_ERR_LIMIT:   int64 := 0 - 4;   // zu viele oder zu grosse Dateien
+pub con PK_ERR_READ:    int64 := 0 - 5;   // Datei liess sich nicht lesen
+pub con PK_ERR_TAR:     int64 := 0 - 6;   // tar-Aufbau fehlgeschlagen
+pub con PK_ERR_ZSTD:    int64 := 0 - 7;   // Kompression fehlgeschlagen
+pub con PK_ERR_WRITE:   int64 := 0 - 8;   // Archiv liess sich nicht schreiben
+
+con PK_PATH_MAX:  int64 := 4096;
+con PK_MAX_FILES: int64 := 512;
+con PK_FILE_MAX:  int64 := 16777216;   // 16 MiB je Datei
+con PK_TOTAL_MAX: int64 := 67108864;   // 64 MiB entpackt, wie die Entpackgrenze
+con PK_DEPTH_MAX: int64 := 4;
+
+// ---------------------------------------------------------------------------
+// Kleine Helfer
+// ---------------------------------------------------------------------------
+
+fn pkAppend(buf: int64, pos: int64, s: pchar): int64 {
+  if s == 0 as pchar { return pos; }
+  var slen: int64 := StrLen(s);
+  memcpy(buf + pos, s as int64, slen);
+  return pos + slen;
+}
+
+fn pkEnd(buf: int64, pos: int64): void {
+  poke8(buf + pos, 0);
+}
+
+// Gehoert der Eintrag ins Archiv?
+//
+// Versteckte Dateien fliegen raus (auch .git und .gitignore), ebenso lyx.lock,
+// bin/ und fertige Archive. Der Rest kommt mit: ein Paket soll seine Doku und
+// Tests mitbringen duerfen, ohne dass hier eine Positivliste gepflegt wird.
+fn pkInclude(name: pchar, isDir: bool): bool {
+  if name == 0 as pchar { return false; }
+  var n: int64 := StrLen(name);
+  if n == 0 { return false; }
+  if peek8(name as int64) as int64 == 46 { return false; }     // .*
+
+  if isDir {
+    if StrCmp(name, "bin"c) == 0 { return false; }
+    return true;
+  }
+
+  if StrCmp(name, "lyx.lock"c) == 0 { return false; }
+  if StrCmp(name, "FILES.sha256"c) == 0 { return false; }      // wird erzeugt
+
+  // *.lxpkg: ein frueher gebautes Archiv gehoert nicht ins naechste.
+  if n > 6 {
+    var suffix: pchar := ".lxpkg"c;
+    var i: int64 := 0;
+    var same: bool := true;
+    while i < 6 {
+      if peek8(name as int64 + n - 6 + i) as int64 != peek8(suffix as int64 + i) as int64 {
+        same := false;
+        break;
+      }
+      i := i + 1;
+    }
+    if same { return false; }
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Dateiliste einsammeln
+// ---------------------------------------------------------------------------
+//
+// Gesammelt werden Pfade relativ zum Paketwurzelverzeichnis, jeweils als
+// eigener Puffer der Groesse PK_PATH_MAX. Die Liste ist ein Array von Zeigern.
+
+var pkNames: int64 := 0;   // int64[PK_MAX_FILES], Zeiger auf relative Pfade
+var pkCount: int64 := 0;
+
+fn pkListInit(): void {
+  pkNames := alloc(PK_MAX_FILES * 8);
+  pkCount := 0;
+}
+
+fn pkListFree(): void {
+  var i: int64 := 0;
+  while i < pkCount {
+    free(peek64(pkNames + i * 8), PK_PATH_MAX);
+    i := i + 1;
+  }
+  free(pkNames, PK_MAX_FILES * 8);
+  pkNames := 0;
+  pkCount := 0;
+}
+
+fn pkListAdd(rel: int64): bool {
+  if pkCount >= PK_MAX_FILES { return false; }
+  var copy: int64 := alloc(PK_PATH_MAX);
+  var n: int64 := StrLen(rel as pchar);
+  memcpy(copy, rel, n);
+  poke8(copy + n, 0);
+  poke64(pkNames + pkCount * 8, copy);
+  pkCount := pkCount + 1;
+  return true;
+}
+
+// Laeuft durch dir und sammelt alle einzuschliessenden Dateien.
+// relBase ist der bisher aufgebaute relative Pfad ("" auf oberster Ebene).
+// Rueckgabe: false, wenn eine Grenze erreicht wurde.
+fn pkWalk(dir: int64, relBase: int64, depth: int64): bool {
+  if depth > PK_DEPTH_MAX { return true; }
+
+  var dl: int64 := LpmDirOpen(dir as pchar);
+  if dl == 0 { return true; }
+
+  var ok: bool := true;
+  var n: int64 := LpmDirCount(dl);
+  var i: int64 := 0;
+  while i < n {
+    var ename: pchar := LpmDirName(dl, i);
+    var etype: int64 := LpmDirType(dl, i);
+    var isDir: bool := etype == LPD_DT_DIR;
+
+    if pkInclude(ename, isDir) {
+      var sub: int64 := alloc(PK_PATH_MAX);
+      var sp: int64 := 0;
+      sp := pkAppend(sub, sp, dir as pchar);
+      sp := pkAppend(sub, sp, "/"c);
+      sp := pkAppend(sub, sp, ename);
+      pkEnd(sub, sp);
+
+      var rel: int64 := alloc(PK_PATH_MAX);
+      var rp: int64 := 0;
+      if StrLen(relBase as pchar) > 0 {
+        rp := pkAppend(rel, rp, relBase as pchar);
+        rp := pkAppend(rel, rp, "/"c);
+      }
+      rp := pkAppend(rel, rp, ename);
+      pkEnd(rel, rp);
+
+      if isDir {
+        if !pkWalk(sub, rel, depth + 1) { ok := false; }
+      } else {
+        if etype == LPD_DT_REG {
+          if !pkListAdd(rel) { ok := false; }
+        }
+      }
+
+      free(rel, PK_PATH_MAX);
+      free(sub, PK_PATH_MAX);
+    }
+
+    if !ok { break; }
+    i := i + 1;
+  }
+
+  LpmDirClose(dl);
+  return ok;
+}
+
+// Sortiert die Liste nach Namen (Einfuegesortierung — bei hoechstens ein paar
+// hundert Eintraegen ist das schnell genug und bleibt nachvollziehbar).
+// Ohne diesen Schritt haengt der Archivinhalt an der Reihenfolge des
+// Dateisystems, und zwei Baeufe derselben Quellen ergaeben verschiedene SHA256.
+fn pkSort(): void {
+  var i: int64 := 1;
+  while i < pkCount {
+    var cur: int64 := peek64(pkNames + i * 8);
+    var j: int64 := i - 1;
+    while j >= 0 {
+      var other: int64 := peek64(pkNames + j * 8);
+      if StrCmp(other as pchar, cur as pchar) <= 0 { break; }
+      poke64(pkNames + (j + 1) * 8, other);
+      j := j - 1;
+    }
+    poke64(pkNames + (j + 1) * 8, cur);
+    i := i + 1;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Archiv bauen
+// ---------------------------------------------------------------------------
+
+// Baut FILES.sha256: je Zeile "<hex>  <relativer Pfad>".
+// Rueckgabe: Laenge des erzeugten Textes, oder -1.
+fn pkBuildFileList(dir: int64, out: int64, cap: int64): int64 {
+  var pos: int64 := 0;
+  var i: int64 := 0;
+  while i < pkCount {
+    var rel: pchar := peek64(pkNames + i * 8) as pchar;
+
+    var full: int64 := alloc(PK_PATH_MAX);
+    var fp: int64 := 0;
+    fp := pkAppend(full, fp, dir as pchar);
+    fp := pkAppend(full, fp, "/"c);
+    fp := pkAppend(full, fp, rel);
+    pkEnd(full, fp);
+
+    var size: int64 := FileSize(full as pchar);
+    if size < 0 { free(full, PK_PATH_MAX); return 0 - 1; }
+    if size > PK_FILE_MAX { free(full, PK_PATH_MAX); return 0 - 1; }
+
+    var buf: int64 := alloc(size + 1);
+    var got: int64 := ReadFile(full as pchar, buf as pchar, size);
+    free(full, PK_PATH_MAX);
+    if got < 0 { free(buf, size + 1); return 0 - 1; }
+
+    var hex: int64 := alloc(65);
+    SHA256Hex(buf, got, hex);
+    free(buf, size + 1);
+
+    if pos + 64 + 2 + StrLen(rel) + 1 >= cap {
+      free(hex, 65);
+      return 0 - 1;
+    }
+    pos := pkAppend(out, pos, hex as pchar);
+    pos := pkAppend(out, pos, "  "c);
+    pos := pkAppend(out, pos, rel);
+    poke8(out + pos, 10);
+    pos := pos + 1;
+    free(hex, 65);
+
+    i := i + 1;
+  }
+  pkEnd(out, pos);
+  return pos;
+}
+
+// Baut das Archiv aus dir und schreibt es nach outPath.
+// *shaOut (65 Bytes) bekommt den SHA256 des fertigen Archivs.
+// Rueckgabe: PK_OK oder ein PK_ERR_*-Code.
+pub fn PkBuild(dir: pchar, outPath: pchar, shaOut: int64): int64 {
+  pkListInit();
+
+  var root: int64 := alloc(PK_PATH_MAX);
+  var rp: int64 := pkAppend(root, 0, dir);
+  pkEnd(root, rp);
+
+  var empty: int64 := alloc(PK_PATH_MAX);
+  poke8(empty, 0);
+  var walked: bool := pkWalk(root, empty, 0);
+  free(empty, PK_PATH_MAX);
+
+  if !walked {
+    free(root, PK_PATH_MAX);
+    pkListFree();
+    return PK_ERR_LIMIT;
+  }
+  if pkCount == 0 {
+    free(root, PK_PATH_MAX);
+    pkListFree();
+    return PK_ERR_EMPTY;
+  }
+
+  pkSort();
+
+  // FILES.sha256 aus denselben sortierten Daten
+  var listCap: int64 := pkCount * (64 + 2 + 256 + 1) + 16;
+  var listBuf: int64 := alloc(listCap);
+  var listLen: int64 := pkBuildFileList(root, listBuf, listCap);
+  if listLen < 0 {
+    free(listBuf, listCap);
+    free(root, PK_PATH_MAX);
+    pkListFree();
+    return PK_ERR_READ;
+  }
+
+  var tw: int64 := TarWriterNew();
+  var total: int64 := 0;
+  var rc: int64 := PK_OK;
+
+  var i: int64 := 0;
+  while i < pkCount {
+    var rel: pchar := peek64(pkNames + i * 8) as pchar;
+
+    var full: int64 := alloc(PK_PATH_MAX);
+    var fp: int64 := 0;
+    fp := pkAppend(full, fp, root as pchar);
+    fp := pkAppend(full, fp, "/"c);
+    fp := pkAppend(full, fp, rel);
+    pkEnd(full, fp);
+
+    var size: int64 := FileSize(full as pchar);
+    if size < 0 { rc := PK_ERR_READ; }
+    else if size > PK_FILE_MAX { rc := PK_ERR_LIMIT; }
+    else {
+      total := total + size;
+      if total > PK_TOTAL_MAX { rc := PK_ERR_LIMIT; }
+      else {
+        var buf: int64 := alloc(size + 1);
+        var got: int64 := ReadFile(full as pchar, buf as pchar, size);
+        if got < 0 { rc := PK_ERR_READ; }
+        else {
+          if TarWriterAdd(tw, rel as int64, buf, got) != 0 { rc := PK_ERR_TAR; }
+        }
+        free(buf, size + 1);
+      }
+    }
+    free(full, PK_PATH_MAX);
+    if rc != PK_OK { break; }
+    i := i + 1;
+  }
+
+  if rc == PK_OK {
+    if TarWriterAdd(tw, "FILES.sha256"c as int64, listBuf, listLen) != 0 {
+      rc := PK_ERR_TAR;
+    }
+  }
+
+  free(listBuf, listCap);
+  free(root, PK_PATH_MAX);
+  pkListFree();
+
+  if rc != PK_OK {
+    TarWriterFree(tw);
+    return rc;
+  }
+
+  // tar zunaechst neben das Ziel schreiben, dann komprimieren. Der Umweg ueber
+  // die Datei spart eine zweite Fassung des Archivs im Speicher.
+  var tarPath: int64 := alloc(PK_PATH_MAX);
+  var tp: int64 := 0;
+  tp := pkAppend(tarPath, tp, outPath);
+  tp := pkAppend(tarPath, tp, ".tar"c);
+  pkEnd(tarPath, tp);
+
+  if TarWriterSave(tw, tarPath as pchar) != 0 {
+    TarWriterFree(tw);
+    free(tarPath, PK_PATH_MAX);
+    return PK_ERR_WRITE;
+  }
+  TarWriterFree(tw);
+
+  var tarSize: int64 := FileSize(tarPath as pchar);
+  if tarSize <= 0 {
+    DeleteFile(tarPath as pchar);
+    free(tarPath, PK_PATH_MAX);
+    return PK_ERR_WRITE;
+  }
+
+  var tarBuf: int64 := alloc(tarSize + 1);
+  var readN: int64 := ReadFile(tarPath as pchar, tarBuf as pchar, tarSize);
+  DeleteFile(tarPath as pchar);
+  free(tarPath, PK_PATH_MAX);
+  if readN != tarSize {
+    free(tarBuf, tarSize + 1);
+    return PK_ERR_READ;
+  }
+
+  // Reserve fuer den ungluecklichen Fall, dass die Kompression nichts bringt.
+  var zcap: int64 := tarSize + tarSize / 8 + 1024;
+  var zbuf: int64 := alloc(zcap);
+  var zlen: int64 := ZstdCompress(tarBuf, tarSize, zbuf, zcap);
+  free(tarBuf, tarSize + 1);
+
+  if zlen <= 0 {
+    free(zbuf, zcap);
+    return PK_ERR_ZSTD;
+  }
+
+  var wrote: int64 := WriteFile(outPath, zbuf as pchar, zlen);
+  if wrote != zlen {
+    free(zbuf, zcap);
+    return PK_ERR_WRITE;
+  }
+
+  SHA256Hex(zbuf, zlen, shaOut);
+  free(zbuf, zcap);
+  return PK_OK;
+}
+
+// Baut den Standard-Dateinamen eines Archivs: net/http @ 1.2.0 wird zu
+// "net_http-1.2.0.lxpkg". Slashes werden zu Unterstrichen, damit der Name in
+// jedem Verzeichnis liegen kann.
+pub fn PkArchiveName(name: pchar, version: pchar, out: int64, cap: int64): bool {
+  var need: int64 := StrLen(name) + StrLen(version) + 8;
+  if need >= cap { return false; }
+
+  var p: int64 := 0;
+  var n: int64 := StrLen(name);
+  var i: int64 := 0;
+  while i < n {
+    var c: int64 := peek8(name as int64 + i) as int64;
+    if c == 47 { c := 95; }
+    poke8(out + p, c as int8);
+    p := p + 1;
+    i := i + 1;
+  }
+  p := pkAppend(out, p, "-"c);
+  p := pkAppend(out, p, version);
+  p := pkAppend(out, p, ".lxpkg"c);
+  pkEnd(out, p);
+  return true;
+}
+
+pub fn PkErrStr(code: int64): pchar {
+  if code == PK_OK           { return "ok"c; }
+  if code == PK_ERR_NOTOML   { return "kein lyx.toml in diesem Verzeichnis"c; }
+  if code == PK_ERR_MANIFEST { return "lyx.toml ist unvollstaendig (name und version noetig)"c; }
+  if code == PK_ERR_EMPTY    { return "keine Datei zum Einpacken gefunden"c; }
+  if code == PK_ERR_LIMIT    { return "zu viele oder zu grosse Dateien"c; }
+  if code == PK_ERR_READ     { return "eine Datei liess sich nicht lesen"c; }
+  if code == PK_ERR_TAR      { return "tar-Aufbau fehlgeschlagen"c; }
+  if code == PK_ERR_ZSTD     { return "Kompression fehlgeschlagen"c; }
+  if code == PK_ERR_WRITE    { return "Archiv liess sich nicht schreiben"c; }
+  return "unbekannter Fehler"c;
+}

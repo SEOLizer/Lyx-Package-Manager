@@ -22,6 +22,7 @@ import lpm.core.resolver;
 import lpm.core.index;
 import lpm.core.localcat;
 import lpm.core.fetch;
+import lpm.core.pack;
 
 // ---------------------------------------------------------------------------
 // Schreib-Hilfsfunktionen (via sys_write — kein io-Import nötig)
@@ -124,6 +125,7 @@ fn lpmHelp(): void {
   cmdOutLn("  search <query>         Registry durchsuchen"c);
   cmdOutLn("  info <pkg>             Paketdetails anzeigen"c);
   cmdOutLn("  list                   Aufgelöste Pakete aus lyx.lock anzeigen"c);
+  cmdOutLn("  pack [<dir>]           Verzeichnis zu einem .lxpkg packen"c);
   cmdOutLn("  publish                Paket in Registry hochladen"c);
   cmdOutLn("  login                  Registry-Authentifizierung"c);
   cmdOutLn("  resolve <pkg> [--entry] Import-Auflösung für lyxc (intern):"c);
@@ -1321,6 +1323,90 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
 }
 
 // ---------------------------------------------------------------------------
+// pack — aus dem aktuellen Verzeichnis ein .lxpkg bauen
+// ---------------------------------------------------------------------------
+
+fn lpmPack(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var dir: pchar := ctx.LcSubArg(0);
+  if dir == 0 as pchar { dir := "."c; }
+
+  // Name und Version kommen aus dem Manifest des Pakets, nicht von der
+  // Kommandozeile: ein Archiv, dessen Dateiname nicht zu seinem Inhalt passt,
+  // waere die erste Quelle fuer Verwechslungen in der Registry.
+  var toml: int64 := alloc(CMD_PATH_MAX);
+  var tp: int64 := 0;
+  tp := cmdWrS(toml, tp, dir);
+  tp := cmdWrS(toml, tp, "/lyx.toml"c);
+  poke8(toml + tp, 0);
+
+  if !FileExists(toml as pchar) {
+    cmdErr(PkErrStr(PK_ERR_NOTOML));
+    free(toml, CMD_PATH_MAX);
+    return 1;
+  }
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  var read: bool := mf.MfRead(toml as pchar);
+  free(toml, CMD_PATH_MAX);
+  if !read {
+    cmdErr("lyx.toml liess sich nicht lesen."c);
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  var pname: pchar := mf.MfName();
+  var pver:  pchar := mf.MfVersion();
+  var haveName: bool := false;
+  var haveVer:  bool := false;
+  if pname != 0 as pchar { if peek8(pname as int64) as int64 != 0 { haveName := true; } }
+  if pver  != 0 as pchar { if peek8(pver  as int64) as int64 != 0 { haveVer  := true; } }
+  if !haveName || !haveVer {
+    cmdErr(PkErrStr(PK_ERR_MANIFEST));
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  var fname: int64 := alloc(CMD_PATH_MAX);
+  if !PkArchiveName(pname, pver, fname, CMD_PATH_MAX) {
+    cmdErr("Paketname oder Version zu lang."c);
+    free(fname, CMD_PATH_MAX);
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  var out: int64 := alloc(CMD_PATH_MAX);
+  var op: int64 := 0;
+  op := cmdWrS(out, op, dir);
+  op := cmdWrS(out, op, "/"c);
+  op := cmdWrS(out, op, fname as pchar);
+  poke8(out + op, 0);
+  free(fname, CMD_PATH_MAX);
+
+  var sha: int64 := alloc(65);
+  var rc: int64 := PkBuild(dir, out as pchar, sha);
+
+  if rc != PK_OK {
+    cmdErr(PkErrStr(rc));
+    free(sha, 65);
+    free(out, CMD_PATH_MAX);
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  cmdOut("lpm: "c); cmdOut(pname); cmdOut("@"c); cmdOut(pver);
+  cmdOutLn(" gepackt:"c);
+  cmdOut("  "c); cmdOutLn(out as pchar);
+  cmdOut("  sha256 "c); cmdOutLn(sha as pchar);
+  cmdOut("  "c); cmdOutInt(FileSize(out as pchar)); cmdOutLn(" Bytes"c);
+
+  free(sha, 65);
+  free(out, CMD_PATH_MAX);
+  mf.MfFree(); dispose mf;
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Stubs für netzwerkabhängige Befehle
 // ---------------------------------------------------------------------------
 
@@ -1349,6 +1435,7 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if StrCmp(cmd, "search"c)  == 0 { return lpmSearch(ctx, argc, argv); }
   if StrCmp(cmd, "info"c)    == 0 { return lpmInfo(ctx, argc, argv); }
   if StrCmp(cmd, "list"c)    == 0 { return lpmList(argc, argv); }
+  if StrCmp(cmd, "pack"c)    == 0 { return lpmPack(ctx, argc, argv); }
   if StrCmp(cmd, "publish"c) == 0 { return lpmNotImpl("publish"c); }
   if StrCmp(cmd, "login"c)   == 0 { return lpmNotImpl("login"c); }
   if StrCmp(cmd, "resolve"c) == 0 { return lpmResolve(ctx, argc, argv); }
