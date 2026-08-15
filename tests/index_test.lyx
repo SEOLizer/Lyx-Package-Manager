@@ -183,6 +183,25 @@ fn testRootIndex(): void {
   pl.PlFree(); dispose pl;
 }
 
+fn testUnicode(): void {
+  outLn("\\u-Escapes"c);
+  var pl: PkgList := new PkgList();
+  pl.PlInit();
+  // PHPs json_encode schreibt Nicht-ASCII ohne JSON_UNESCAPED_UNICODE immer so.
+  IxParseRootIndex(
+    "{\"packages\":[{\"name\":\"a/b\",\"description\":\"Gr\\u00f6\\u00dfe \\u2014 Ma\\u00df\"}]}"c, pl);
+  okStr("Umlaute und Gedankenstrich"c, pl.PlDesc(0), "Größe — Maß"c);
+  pl.PlFree(); dispose pl;
+
+  var pl2: PkgList := new PkgList();
+  pl2.PlInit();
+  // Surrogatpaar: U+1F600
+  IxParseRootIndex(
+    "{\"packages\":[{\"name\":\"a/b\",\"description\":\"x\\ud83d\\ude00y\"}]}"c, pl2);
+  okStr("Surrogatpaar"c, pl2.PlDesc(0), "x😀y"c);
+  pl2.PlFree(); dispose pl2;
+}
+
 fn testRootIndexRobust(): void {
   outLn("Gesamtindex, Sonderfaelle"c);
 
@@ -276,6 +295,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testEmptyVersions();
   testRootIndex();
   testRootIndexRobust();
+  testUnicode();
   testEndToEnd();
 
   outLn(""c);

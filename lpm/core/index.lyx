@@ -53,6 +53,53 @@ fn ixWs(buf: int64, i: int64): int64 {
 }
 
 // Liest einen JSON-String ab Position i (dort steht das oeffnende ").
+// Liest vier Hexziffern ab i. Rueckgabe: Wert, oder -1.
+fn ixHex4(buf: int64, i: int64): int64 {
+  var v: int64 := 0;
+  var k: int64 := 0;
+  while k < 4 {
+    var c: int64 := peek8(buf + i + k) as int64;
+    var d: int64 := 0 - 1;
+    if c >= 48 { if c <= 57  { d := c - 48; } }
+    if c >= 97 { if c <= 102 { d := c - 87; } }
+    if c >= 65 { if c <= 70  { d := c - 55; } }
+    if d < 0 { return 0 - 1; }
+    v := v * 16 + d;
+    k := k + 1;
+  }
+  return v;
+}
+
+// Haengt einen Codepoint als UTF-8 an dst[n] an. Rueckgabe: neue Position.
+// Passt die Folge nicht mehr in den Puffer, wird sie ganz weggelassen — ein
+// halbes Zeichen waere schlimmer als ein fehlendes.
+fn ixUtf8(dst: int64, n: int64, cap: int64, cp: int64): int64 {
+  if cp < 128 {
+    if n + 1 >= cap { return n; }
+    poke8(dst + n, cp as int8);
+    return n + 1;
+  }
+  if cp < 2048 {
+    if n + 2 >= cap { return n; }
+    poke8(dst + n,     (192 + cp / 64) as int8);
+    poke8(dst + n + 1, (128 + cp % 64) as int8);
+    return n + 2;
+  }
+  if cp < 65536 {
+    if n + 3 >= cap { return n; }
+    poke8(dst + n,     (224 + cp / 4096) as int8);
+    poke8(dst + n + 1, (128 + (cp / 64) % 64) as int8);
+    poke8(dst + n + 2, (128 + cp % 64) as int8);
+    return n + 3;
+  }
+  if n + 4 >= cap { return n; }
+  poke8(dst + n,     (240 + cp / 262144) as int8);
+  poke8(dst + n + 1, (128 + (cp / 4096) % 64) as int8);
+  poke8(dst + n + 2, (128 + (cp / 64) % 64) as int8);
+  poke8(dst + n + 3, (128 + cp % 64) as int8);
+  return n + 4;
+}
+
 // Schreibt den entpackten Inhalt nach dst. Rueckgabe: Position hinter dem
 // schliessenden ", oder -1 bei Syntaxfehler.
 fn ixString(buf: int64, i: int64, dst: int64, cap: int64): int64 {
@@ -72,9 +119,34 @@ fn ixString(buf: int64, i: int64, dst: int64, cap: int64): int64 {
       else if e == 116 { c := 9; }
       else if e == 114 { c := 13; }
       else if e == 117 {
-        // \uXXXX wird nicht dekodiert — als '?' abgelegt, Position weiter.
-        c := 63;
+        // \uXXXX nach UTF-8. Registry-Server schreiben Umlaute und Gedankenstriche
+        // regelmaessig so (PHPs json_encode tut es ohne JSON_UNESCAPED_UNICODE
+        // immer), und eine Beschreibung voller Fragezeichen ist kein Ergebnis.
+        var cp: int64 := ixHex4(buf, p + 1);
+        if cp < 0 { return 0 - 1; }
         p := p + 4;
+
+        // Surrogatpaar: der hohe Halbwert allein ergibt kein Zeichen, der
+        // niedrige folgt als zweites \uXXXX.
+        if cp >= 55296 {
+          if cp <= 56319 {
+            if peek8(buf + p + 1) as int64 == 92 {
+              if peek8(buf + p + 2) as int64 == 117 {
+                var lo: int64 := ixHex4(buf, p + 3);
+                if lo >= 56320 {
+                  if lo <= 57343 {
+                    cp := 65536 + (cp - 55296) * 1024 + (lo - 56320);
+                    p := p + 6;
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        n := ixUtf8(dst, n, cap, cp);
+        p := p + 1;
+        continue;
       }
       else { c := e; }
     }

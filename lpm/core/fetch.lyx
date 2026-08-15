@@ -275,6 +275,87 @@ fn ftIsFresh(path: int64): bool {
 }
 
 // ---------------------------------------------------------------------------
+// Chunked Transfer-Encoding
+// ---------------------------------------------------------------------------
+//
+// std.net.https gibt den Rumpf so weiter, wie er auf der Leitung ankam — auch
+// wenn er in Chunks zerlegt ist. std.net.http kann das aufloesen (WP-C6), die
+// HTTPS-Variante bringt aber ihren eigenen, unvollstaendigen Parser mit. Ein
+// gechunkter Index kommt deshalb mit Laengenangaben durchsetzt an:
+//
+//   476\r\n{ "generated": ... }\r\n0\r\n\r\n
+//
+// Cloudflare liefert genau so, sobald eine Antwort eine gewisse Groesse hat.
+// Solange das in der Standardbibliothek nicht behoben ist, loest lpm es selbst
+// auf. Erkannt wird es an der Form, nicht am Header: Transfer-Encoding steht in
+// resp.headersRaw, und das Feld wird von std.net.https nicht gefuellt.
+//
+// Die Erkennung ist sicher, weil kein erwarteter Rumpf so beginnen kann: JSON
+// faengt mit '{' an, ein .lxpkg mit den zstd-Magic-Bytes — beides keine
+// Hexziffern. Dekodiert wird nur, wenn die Kette restlos aufgeht und mit einem
+// 0-Chunk endet; sonst bleibt der Puffer unangetastet.
+
+// Hexziffer -> Wert, oder -1.
+fn ftHexVal(c: int64): int64 {
+  if c >= 48 { if c <= 57  { return c - 48; } }
+  if c >= 97 { if c <= 102 { return c - 87; } }
+  if c >= 65 { if c <= 70  { return c - 55; } }
+  return 0 - 1;
+}
+
+// Loest Chunked-Kodierung in buf auf (in place, das Ergebnis ist immer kuerzer).
+// Rueckgabe: neue Laenge, oder -1 wenn buf nicht gechunkt ist.
+fn ftDechunk(buf: int64, len: int64): int64 {
+  if len < 5 { return 0 - 1; }
+  if ftHexVal(peek8(buf) as int64) < 0 { return 0 - 1; }
+
+  var read: int64 := 0;
+  var write: int64 := 0;
+
+  while true {
+    // Chunk-Groesse als Hexzahl, danach CRLF. Eine Erweiterung nach ';' wird
+    // ueberlesen — sie kommt hier nicht vor, kostet aber nichts.
+    var size: int64 := 0;
+    var digits: int64 := 0;
+    while read < len {
+      var v: int64 := ftHexVal(peek8(buf + read) as int64);
+      if v < 0 { break; }
+      size := size * 16 + v;
+      digits := digits + 1;
+      read := read + 1;
+      if digits > 8 { return 0 - 1; }
+    }
+    if digits == 0 { return 0 - 1; }
+
+    while read < len {
+      if peek8(buf + read) as int64 == 13 { break; }
+      if peek8(buf + read) as int64 == 10 { break; }
+      read := read + 1;
+    }
+    if read + 1 >= len { return 0 - 1; }
+    if peek8(buf + read) as int64 == 13 { read := read + 1; }
+    if peek8(buf + read) as int64 != 10 { return 0 - 1; }
+    read := read + 1;
+
+    if size == 0 { break; }              // letzter Chunk
+
+    if read + size > len { return 0 - 1; }
+    if write != read { memcpy(buf + write, buf + read, size); }
+    write := write + size;
+    read := read + size;
+
+    // CRLF hinter den Daten
+    if read + 1 >= len { return 0 - 1; }
+    if peek8(buf + read) as int64 == 13 { read := read + 1; }
+    if peek8(buf + read) as int64 != 10 { return 0 - 1; }
+    read := read + 1;
+  }
+
+  poke8(buf + write, 0);
+  return write;
+}
+
+// ---------------------------------------------------------------------------
 // Transport
 // ---------------------------------------------------------------------------
 
@@ -345,6 +426,10 @@ fn ftGet(host: pchar, path: pchar, outBuf: int64, outLen: int64, maxLen: int64,
   var buf: int64 := alloc(size + 1);
   memcpy(buf, resp.bodyPtr, size);
   poke8(buf + size, 0);
+
+  // Gechunkte Antwort? Dann hier aufloesen — siehe ftDechunk.
+  var unchunked: int64 := ftDechunk(buf, size);
+  if unchunked >= 0 { size := unchunked; }
   // ETag-Extraktion ist hier bewusst NICHT verdrahtet: std.net.https fuellt
   // resp.headersRaw nicht — das Feld wird in HTTPSGet/HTTPSSend nie gesetzt und
   // enthaelt einen undefinierten Wert (LyX-Compiler-Issue, siehe README).
