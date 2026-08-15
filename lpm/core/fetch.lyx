@@ -589,7 +589,7 @@ fn ftMirror(registry: pchar, regDir: pchar, relPath: pchar, force: bool): int64 
 // Spiegelt /packages/<name>/index.json.
 // Der Paketname geht unveraendert in den Pfad (siehe docs/registry.md); dass er
 // keine Traversal-Segmente enthaelt, garantiert FtNameIsSafe.
-pub fn FtSyncPackageIndex(home: pchar, registry: pchar, name: pchar): int64 {
+pub fn FtSyncPackageIndex(home: pchar, registry: pchar, name: pchar, force: bool): int64 {
   if !FtNameIsSafe(name) { return FT_ERR_URL; }
   if !ftUrlOk(registry) { return FT_ERR_URL; }
   if !LpmCacheEnsure(home) { return FT_ERR_WRITE; }
@@ -602,7 +602,7 @@ pub fn FtSyncPackageIndex(home: pchar, registry: pchar, name: pchar): int64 {
   ftEnd(rel, p);
 
   var regDir: pchar := LpmCacheRegistryDir(home);
-  var rc: int64 := ftMirror(registry, regDir, rel as pchar, false);
+  var rc: int64 := ftMirror(registry, regDir, rel as pchar, force);
   LpmCacheFreePath(regDir);
   free(rel, FT_PATH_MAX);
   return rc;

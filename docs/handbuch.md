@@ -373,7 +373,7 @@ $ lpm search http
 
 | Aufgabe | Befehl |
 |---|---|
-| Paketliste auffrischen | `lpm update` |
+| Pakete aktualisieren | `lpm update` bzw. `lpm update <pkg>` |
 | Suchen (Name und Beschreibung) | `lpm search <text>` |
 | Details und Versionen | `lpm info <paket>` |
 | Gecachte Pakete anzeigen | `lpm cache list` |
@@ -381,6 +381,34 @@ $ lpm search http
 | Ohne Netz arbeiten | jeder Befehl mit `--offline` |
 | Andere Registry | jeder Befehl mit `--registry=<url>` |
 | Mehr Ausgabe | `--verbose` |
+
+### Aktualisieren
+
+`lpm update` holt den Index frisch und löst danach neu auf — **innerhalb der
+Constraints aus `lyx.toml`**. Geändert wird nur `lyx.lock`:
+
+```console
+$ lpm update
+lpm: hole demo/base@1.5.0 von https://lpm.seolizer.de
+  ~ demo/base 1.0.0 -> 1.5.0
+lpm: 1 Aenderung(en).
+```
+
+Die Zeichen vor dem Namen: `~` geändert, `+` neu hinzugekommen, `-` weggefallen
+(etwa weil eine neue Version des Elternpakets die Abhängigkeit nicht mehr hat).
+
+Steht in `lyx.toml` `"demo/base" = "^1.0.0"`, dann kommt `update` bis `1.5.0`,
+aber nicht auf `2.0.0` — dafür muss das Constraint selbst weiter gefasst
+werden (`lpm install demo/base@^2.0.0`). Das Manifest rührt `update` nie an.
+
+**Ein einzelnes Paket** aktualisieren, ohne den Rest zu bewegen:
+
+```console
+$ lpm update demo/base
+```
+
+Alle übrigen Einträge aus `lyx.lock` werden dabei auf ihrer Version
+festgehalten.
 
 **Der Index wird eine Stunde lang gespiegelt.** Innerhalb dieser Zeit fragt
 `search` und `info` nicht erneut nach; `lpm update` umgeht die Frist.
@@ -426,6 +454,7 @@ lpm: error: unvereinbare Versions-Constraints — demo/base (^1.0.0 gegen ^2.0.0
 | `Paket nicht in der Registry` | Name unbekannt; mit `--offline` nur der lokale Spiegel durchsucht |
 | `unvereinbare Versions-Constraints` | Zwei Pakete fordern Unvereinbares, beide Bedingungen werden genannt |
 | `SHA256 stimmt nicht` | Heruntergeladenes Archiv passt nicht zu `lyx.lock`. Wird gelöscht, nie entpackt |
+| `Datei im Cache wurde veraendert` | Ein Paket unter `~/.lpm/cache` weicht von seinem `FILES.sha256` ab. Es wird verworfen und neu geholt; mit `--offline` bleibt es bei der Meldung |
 | `kein lyx.toml in diesem Verzeichnis` | `lpm pack`/`publish` im falschen Verzeichnis |
 | `lyx.toml ist unvollstaendig` | `name` oder `version` fehlt |
 | `keine Datei zum Einpacken gefunden` | Alles im Verzeichnis fällt unter die Ausschlüsse |
@@ -459,9 +488,6 @@ Ehrlichkeit an dieser Stelle spart Suchzeit:
   mit Trust-on-first-use ist geplant (WP-PM-10).
 - **Kein Zurückziehen über den Client.** `yanked` muss der Betreiber von Hand
   setzen, siehe `deploy/README.md`.
-- **`lpm update` aktualisiert keine Pakete**, sondern nur den Index. Eine neue
-  Version bekommst du, indem du das Constraint in `lyx.toml` änderst und
-  `lpm install` aufrufst — oder `lyx.lock` löschst.
 - **Der Compiler ruft `lpm` noch nicht selbst auf.** `lpm resolve` liegt
   bereit, die Compiler-Seite fehlt (siehe `compiler-integration.md`).
 - **Keine `[dev-dependencies]`-Auswertung.** Das Feld wird geparst, aber bei

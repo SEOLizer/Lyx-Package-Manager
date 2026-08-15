@@ -84,20 +84,20 @@ fn testUrlRejected(): void {
 
   // Der unsichere Name schlaegt zu, bevor die URL ueberhaupt betrachtet wird.
   ok("unsicherer Name"c,
-     FtSyncPackageIndex(home, "https://example.org"c, "../etc"c) == FT_ERR_URL);
+     FtSyncPackageIndex(home, "https://example.org"c, "../etc"c, false) == FT_ERR_URL);
 
   ok("http statt https"c,
-     FtSyncPackageIndex(home, "http://example.org"c, "net/http"c) == FT_ERR_URL);
+     FtSyncPackageIndex(home, "http://example.org"c, "net/http"c, false) == FT_ERR_URL);
   ok("ohne Schema"c,
-     FtSyncPackageIndex(home, "example.org"c, "net/http"c) == FT_ERR_URL);
+     FtSyncPackageIndex(home, "example.org"c, "net/http"c, false) == FT_ERR_URL);
   ok("leere URL"c,
-     FtSyncPackageIndex(home, ""c, "net/http"c) == FT_ERR_URL);
+     FtSyncPackageIndex(home, ""c, "net/http"c, false) == FT_ERR_URL);
   ok("nullzeiger"c,
-     FtSyncPackageIndex(home, 0 as pchar, "net/http"c) == FT_ERR_URL);
+     FtSyncPackageIndex(home, 0 as pchar, "net/http"c, false) == FT_ERR_URL);
   ok("nur Schema"c,
-     FtSyncPackageIndex(home, "https://"c, "net/http"c) == FT_ERR_URL);
+     FtSyncPackageIndex(home, "https://"c, "net/http"c, false) == FT_ERR_URL);
   ok("Port nicht unterstuetzt"c,
-     FtSyncPackageIndex(home, "https://example.org:8443"c, "net/http"c) == FT_ERR_URL);
+     FtSyncPackageIndex(home, "https://example.org:8443"c, "net/http"c, false) == FT_ERR_URL);
 }
 
 // ---------------------------------------------------------------------------

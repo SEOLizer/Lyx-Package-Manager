@@ -86,7 +86,7 @@ lpm <subcommand> [optionen]
 | `lpm cache add <f> <n> <v>` | Lokales `.lxpkg` in den Cache entpacken | ✅ |
 | `lpm install [<pkg[@ver]>]` | Auflösen, herunterladen, verifizieren, `lyx.lock` schreiben | ✅ |
 | `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen, Lock neu schreiben | ✅ |
-| `lpm update` | Registry-Gesamtindex neu spiegeln | ✅ |
+| `lpm update [<pkg>]` | Index auffrischen und Pakete im Rahmen der Constraints aktualisieren | ✅ |
 | `lpm search <query>` | Registry durchsuchen (Name und Beschreibung) | ✅ |
 | `lpm info <pkg>` | Paketdetails und Versionsliste anzeigen | ✅ |
 | `lpm list` | Aufgelöste Pakete aus `lyx.lock` anzeigen | ✅ |
