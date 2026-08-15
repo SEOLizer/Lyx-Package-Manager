@@ -79,7 +79,7 @@ lpm <subcommand> [optionen]
 | `lpm list` | Aufgelöste Pakete aus `lyx.lock` anzeigen | ✅ |
 | `lpm publish` | Paket in die Registry hochladen | ⬜ |
 | `lpm login` | Registry-Authentifizierung | ⬜ |
-| `lpm resolve <pkg>` | Import-Auflösung für `lyxc` (intern) | ⬜ |
+| `lpm resolve <pkg>` | Import-Auflösung für `lyxc` (intern) | 🟡 |
 
 Globale Optionen:
 
@@ -258,7 +258,7 @@ Der ausführliche Fahrplan liegt im `aurum`-Repository unter
 |-------------|---------------|----------|--------|
 | M1 Offline-Grundlage | PM-01 – PM-03 | `init`, `cache`, lokale Pakete | ✅ |
 | M2 Install-Flow | PM-04 – PM-06 | `install` gegen Registry | 🟡 fast fertig |
-| M3 Compiler-Integration | PM-07 | `lyxc` löst Imports automatisch auf | ⬜ |
+| M3 Compiler-Integration | PM-07 | `lyxc` löst Imports automatisch auf | 🟡 in Arbeit |
 | M4 Ökosystem-Launch | PM-08 – PM-10 | `publish` + öffentliche Registry | ⬜ |
 | M5 Enterprise | PM-11 | Monorepo-/Workspace-Support | ⬜ |
 
@@ -300,6 +300,14 @@ aufgelöst — transitive Abhängigkeiten tauchen erst auf, wenn der Index ihres
 Elternpakets gelesen ist. Was aufgelöst ist und nicht im Cache liegt, wird
 heruntergeladen, gegen den `sha256` aus `lyx.lock` geprüft und erst dann
 entpackt. Ein zweites `lpm install` ohne Änderung rechnet nicht neu.
+
+Von PM-07 ist die lpm-Seite fertig: `lpm resolve <pkg>` löst auf, lädt bei
+Bedarf und schreibt **genau den Cache-Pfad** auf stdout, Exit 0 heißt „liegt im
+Cache, Pfad gilt". Alle Meldungen gehen nach stderr, auch die von `--verbose` —
+der Compiler soll stdout direkt als Pfad lesen können. Importnamen werden
+übersetzt (`net.http` → `net/http`), ein vorhandener Lock-Eintrag hat Vorrang
+vor der neuesten Version. Offen ist die Compiler-Seite: `lyxc` ruft `lpm
+resolve` noch nicht auf.
 
 `lpm search` und `lpm info` lesen den Gesamtindex `/index.json`; der Spiegel
 bekommt eine TTL von einer Stunde (Zeitstempel in einer `.meta` neben jeder
