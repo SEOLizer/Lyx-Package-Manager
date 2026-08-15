@@ -1,8 +1,8 @@
 // lpm/cli/commands.lyx
 // WP-PM-02: Subcommand-Dispatch und Implementierungen.
-// Voll implementiert: help, version, init, cache list, cache clean.
-// Stubs (noch kein Netzwerk): install, remove, update, search, info,
-//                              list, publish, login, resolve.
+// Voll implementiert: help, version, init, cache list/clean/add, install,
+// remove, list, update, search, info, resolve.
+// Stubs: publish, login (brauchen Registry-Auth, WP-PM-08).
 
 @description("lpm subcommand dispatch")
 @author("Andreas Röne")
@@ -126,7 +126,9 @@ fn lpmHelp(): void {
   cmdOutLn("  list                   Aufgelöste Pakete aus lyx.lock anzeigen"c);
   cmdOutLn("  publish                Paket in Registry hochladen"c);
   cmdOutLn("  login                  Registry-Authentifizierung"c);
-  cmdOutLn("  resolve <pkg>          Import-Auflösung für lyxc (intern)"c);
+  cmdOutLn("  resolve <pkg> [--entry] Import-Auflösung für lyxc (intern):"c);
+  cmdOutLn("                         schreibt den Cache-Pfad auf stdout, mit"c);
+  cmdOutLn("                         --entry die Unit-Datei darin"c);
   cmdOutLn("  cache list             Gecachte Pakete anzeigen"c);
   cmdOutLn("  cache clean            Cache leeren"c);
   cmdOutLn("  cache add <f> <n> <v>  Lokales .lxpkg in den Cache entpacken"c);
@@ -286,6 +288,7 @@ con CMD_RES_INCOMPLETE: int64 := 2;
 // erwarteter Normalfall.
 con CMD_SYNC_MAX:  int64 := 64;
 con CMD_NAME_MAX:  int64 := 256;
+con CMD_PATH_MAX:  int64 := 4096;
 
 // Steht name schon in der Liste der in diesem Lauf versuchten Indizes?
 fn cmdSeenHas(seen: int64, n: int64, name: pchar): bool {
@@ -1122,11 +1125,101 @@ fn cmdLockedVersion(name: pchar, verOut: int64, cap: int64): bool {
 }
 
 // Schreibt den Cache-Pfad von name@version auf stdout, mit Zeilenumbruch.
-fn cmdPrintCachePath(home: pchar, name: pchar, version: pchar): void {
-  var p: pchar := LpmCachePkgPath(home, name, version);
-  sys_write(1, p as int64, StrLen(p));
-  sys_write(1, "\n"c as int64, 1);
-  LpmCacheFreePath(p);
+//
+// Mit entry=true wird stattdessen die Unit-Datei im Paket ausgegeben. Der
+// Unterschied ist fuer den Compiler wesentlich: er sucht zu `import net.http`
+// eine Datei, der Cache liefert aber ein Verzeichnis
+// (~/.lpm/cache/net/http/0.1.0/) — und darin heisst die Unit nicht
+// "net/http.lyx", sondern so, wie das Manifest es sagt. Ohne diese Aufloesung
+// muesste der Compiler das Paketlayout kennen.
+//
+// Reihenfolge: [build] entry aus der lyx.toml des Pakets, sonst das letzte
+// Namenssegment als <segment>.lyx, sonst <segment>.lyu. Rueckgabe: false, wenn
+// keine dieser Dateien existiert.
+fn cmdPrintCachePath(home: pchar, name: pchar, version: pchar, entry: bool): bool {
+  var dir: pchar := LpmCachePkgPath(home, name, version);
+
+  if !entry {
+    sys_write(1, dir as int64, StrLen(dir));
+    sys_write(1, "\n"c as int64, 1);
+    LpmCacheFreePath(dir);
+    return true;
+  }
+
+  var file: int64 := alloc(CMD_PATH_MAX);
+  var ok: bool := cmdEntryPath(dir, name, file, CMD_PATH_MAX);
+  LpmCacheFreePath(dir);
+
+  if ok {
+    sys_write(1, file, StrLen(file as pchar));
+    sys_write(1, "\n"c as int64, 1);
+  }
+  free(file, CMD_PATH_MAX);
+  return ok;
+}
+
+// Letztes Segment eines Paketnamens ("net/http" -> "http").
+fn cmdLastSegment(name: pchar): pchar {
+  var n: int64 := StrLen(name);
+  var last: int64 := 0;
+  var i: int64 := 0;
+  while i < n {
+    if peek8(name as int64 + i) as int64 == 47 { last := i + 1; }
+    i := i + 1;
+  }
+  return (name as int64 + last) as pchar;
+}
+
+// Sucht die Unit-Datei eines entpackten Pakets. Siehe cmdPrintCachePath.
+fn cmdEntryPath(dir: pchar, name: pchar, out: int64, cap: int64): bool {
+  // 1. [build] entry aus der lyx.toml des Pakets
+  var toml: int64 := alloc(CMD_PATH_MAX);
+  var p: int64 := 0;
+  p := cmdWrS(toml, p, dir);
+  p := cmdWrS(toml, p, "/lyx.toml"c);
+  poke8(toml + p, 0);
+
+  if FileExists(toml as pchar) {
+    var mf: Manifest := new Manifest();
+    mf.MfInit();
+    if mf.MfRead(toml as pchar) {
+      var e: pchar := mf.MfEntry();
+      if e != 0 as pchar {
+        if peek8(e as int64) as int64 != 0 {
+          p := 0;
+          p := cmdWrS(out, p, dir);
+          p := cmdWrS(out, p, "/"c);
+          p := cmdWrS(out, p, e);
+          poke8(out + p, 0);
+          if FileExists(out as pchar) {
+            mf.MfFree(); dispose mf;
+            free(toml, CMD_PATH_MAX);
+            return true;
+          }
+        }
+      }
+    }
+    mf.MfFree(); dispose mf;
+  }
+  free(toml, CMD_PATH_MAX);
+
+  // 2. <letztes Namenssegment>.lyx, 3. dasselbe mit .lyu
+  var seg: pchar := cmdLastSegment(name);
+  p := 0;
+  p := cmdWrS(out, p, dir);
+  p := cmdWrS(out, p, "/"c);
+  p := cmdWrS(out, p, seg);
+  var base: int64 := p;
+  p := cmdWrS(out, p, ".lyx"c);
+  poke8(out + p, 0);
+  if FileExists(out as pchar) { return true; }
+
+  p := base;
+  p := cmdWrS(out, p, ".lyu"c);
+  poke8(out + p, 0);
+  if FileExists(out as pchar) { return true; }
+
+  return false;
 }
 
 fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
@@ -1141,6 +1234,10 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
     cmdEOutLn("lpm: error: HOME ist nicht gesetzt."c);
     return 1;
   }
+
+  // --entry: statt des Verzeichnisses die Unit-Datei ausgeben. Das ist die
+  // Form, die lyxc direkt einsetzen kann.
+  var wantEntry: bool := ctx.LcHasFlag("--entry"c);
 
   var name: int64 := alloc(CMD_NAME_MAX);
   if !cmdImportToPkg(arg, name, CMD_NAME_MAX) {
@@ -1157,10 +1254,16 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   var locked: bool := cmdLockedVersion(pkg, ver, CMD_NAME_MAX);
   if locked {
     if LpmCacheHas(home, pkg, ver as pchar) {
-      cmdPrintCachePath(home, pkg, ver as pchar);
+      if cmdPrintCachePath(home, pkg, ver as pchar, wantEntry) {
+        free(ver, CMD_NAME_MAX);
+        free(name, CMD_NAME_MAX);
+        return 0;
+      }
+      cmdEOut("lpm: error: "c); cmdEOut(pkg);
+      cmdEOutLn(": keine Unit-Datei im Paket gefunden."c);
       free(ver, CMD_NAME_MAX);
       free(name, CMD_NAME_MAX);
-      return 0;
+      return 1;
     }
   }
 
@@ -1206,9 +1309,14 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
     return 1;
   }
 
-  cmdPrintCachePath(home, pkg, ver2 as pchar);
+  var printed: bool := cmdPrintCachePath(home, pkg, ver2 as pchar, wantEntry);
   free(ver2, CMD_NAME_MAX);
   free(name, CMD_NAME_MAX);
+  if !printed {
+    cmdEOut("lpm: error: "c); cmdEOut(pkg);
+    cmdEOutLn(": keine Unit-Datei im Paket gefunden."c);
+    return 1;
+  }
   return 0;
 }
 

@@ -79,7 +79,7 @@ lpm <subcommand> [optionen]
 | `lpm list` | Aufgelöste Pakete aus `lyx.lock` anzeigen | ✅ |
 | `lpm publish` | Paket in die Registry hochladen | ⬜ |
 | `lpm login` | Registry-Authentifizierung | ⬜ |
-| `lpm resolve <pkg>` | Import-Auflösung für `lyxc` (intern) | 🟡 |
+| `lpm resolve <pkg> [--entry]` | Import-Auflösung für `lyxc` (intern) | ✅ |
 
 Globale Optionen:
 
@@ -302,12 +302,17 @@ heruntergeladen, gegen den `sha256` aus `lyx.lock` geprüft und erst dann
 entpackt. Ein zweites `lpm install` ohne Änderung rechnet nicht neu.
 
 Von PM-07 ist die lpm-Seite fertig: `lpm resolve <pkg>` löst auf, lädt bei
-Bedarf und schreibt **genau den Cache-Pfad** auf stdout, Exit 0 heißt „liegt im
-Cache, Pfad gilt". Alle Meldungen gehen nach stderr, auch die von `--verbose` —
-der Compiler soll stdout direkt als Pfad lesen können. Importnamen werden
+Bedarf und schreibt **genau eine Zeile** auf stdout — ohne `--entry` das
+Paketverzeichnis, mit `--entry` die Unit-Datei darin. Exit 0 heißt „liegt im
+Cache, Pfad gilt". Alle Meldungen gehen nach stderr, auch die von `--verbose`,
+damit der Compiler stdout direkt als Pfad lesen kann. Importnamen werden
 übersetzt (`net.http` → `net/http`), ein vorhandener Lock-Eintrag hat Vorrang
-vor der neuesten Version. Offen ist die Compiler-Seite: `lyxc` ruft `lpm
-resolve` noch nicht auf.
+vor der neuesten Version.
+
+Die Änderungen an `lyxc` selbst gehören ins Compiler-Repository und sind hier
+bewusst nicht umgesetzt. Was dafür nötig wäre — Fundstellen, Stolperstellen und
+der vollständige Aufrufvertrag — steht in
+[`docs/compiler-integration.md`](docs/compiler-integration.md).
 
 `lpm search` und `lpm info` lesen den Gesamtindex `/index.json`; der Spiegel
 bekommt eine TTL von einer Stunde (Zeitstempel in einer `.meta` neben jeder
