@@ -95,21 +95,48 @@ Globale Optionen:
 | `--version`, `-V` | Version ausgeben |
 | `--help`, `-h` | Hilfe anzeigen |
 
-### Beispiel
+### Ein Paket benutzen
 
 ```console
-$ lpm init --name=net/http
-lpm: Paket 'net/http' initialisiert.
-lpm: lyx.toml wurde erstellt.
+$ lpm search http
+  net/http@0.3.0 — HTTP client for Lyx
+lpm: 1 Treffer.
 
-$ lpm cache list
-Gecachte Pakete in /home/user/.lpm/cache:
-  buffer@2.1.3
-  net/http@1.2.0
-  net/http@1.3.0
+$ lpm install net/http
+lpm: hole net/http@0.3.0 von https://lpm.seolizer.de
+lpm: net/http@0.3.0 entpackt (3 Datei(en)).
+lpm: 1 Paket(e) aufgeloest, lyx.lock geschrieben.
 
-3 Paket-Version(en).
+$ lpm list
+Aufgeloeste Pakete (lyx.lock):
+  net/http@0.3.0
 ```
+
+### Ein Paket veröffentlichen
+
+Einmalig anmelden — den Token stellt der Registry-Betreiber aus:
+
+```console
+$ lpm login --token=<token>
+lpm: angemeldet an https://lpm.seolizer.de
+     Token in ~/.lpm/credentials (nur fuer dich lesbar).
+```
+
+Dann im Paketverzeichnis, das ein `lyx.toml` mit `name` und `version` enthält:
+
+```console
+$ lpm publish
+lpm: veroeffentliche net/http@0.3.0 an https://lpm.seolizer.de
+lpm: net/http@0.3.0 ist veroeffentlicht.
+     sha256 75e7cbae5eaa87a569d1edd626647d260d14f97df1888facfbb6c8ae3c92f23c
+```
+
+`publish` packt immer frisch — ein herumliegendes Archiv wird nicht verwendet.
+Wer nur das Archiv braucht, nimmt `lpm pack`; zweimal gepackt ergibt denselben
+SHA256. Eine veröffentlichte Version lässt sich nicht überschreiben; für eine
+Korrektur wird die Versionsnummer erhöht.
+
+Die Serverseite steht in [`deploy/README.md`](deploy/README.md).
 
 ---
 
@@ -206,7 +233,14 @@ lyx-lpm/
       resolver.lyx         Versions-Katalog, Auflösung, Konflikte, Topo-Sort
       index.lyx            Parser für die Registry-Indizes (JSON)
       localcat.lyx         Katalog aus Cache und gespiegelten Indizes
-      fetch.lyx            HTTPS-Transport, Spiegel, TTL
+      fetch.lyx            HTTPS-Transport, Spiegel, TTL, Upload
+      pack.lyx             .lxpkg bauen (reproduzierbar)
+      credentials.lyx      Registry-Token in ~/.lpm/credentials
+  deploy/
+    nginx-lpm.seolizer.de.conf   vhost der Registry
+    api/lib/registry.php         Validierung, Index-Pflege
+    api/v1/publish.php           POST /api/v1/publish
+    README.md                    Server einrichten
   tests/
     resolver_test.lyx      Resolver-Tests (ohne Netz und Dateisystem)
     index_test.lyx         Parser-Tests
