@@ -10,8 +10,10 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 > die öffentliche Registry: leerer Cache → Index per HTTPS → Auflösung → Archiv
 > per HTTPS → SHA256-Prüfung → entpackt im Cache. Funktionsfähig sind `init`,
 > `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list`,
-> `update`, `search`, `info` und `resolve`. Es fehlen `publish` und `login` —
-> siehe [Roadmap](#roadmap).
+> `update`, `search`, `info`, `resolve`, `pack`, `publish`, `login` und
+> `logout` — der Kreis von `pack` über `publish` bis zur Installation auf einem
+> fremden Rechner ist geschlossen. Offen sind Signaturen (PM-10) und die
+> Compiler-Integration (PM-07, Compiler-Seite).
 >
 > Benötigt `lyxc` ≥ 1.0.19E (HTTPS; ohne Netzwerknutzung genügt 1.0.13J).
 
@@ -77,8 +79,10 @@ lpm <subcommand> [optionen]
 | `lpm search <query>` | Registry durchsuchen (Name und Beschreibung) | ✅ |
 | `lpm info <pkg>` | Paketdetails und Versionsliste anzeigen | ✅ |
 | `lpm list` | Aufgelöste Pakete aus `lyx.lock` anzeigen | ✅ |
-| `lpm publish` | Paket in die Registry hochladen | ⬜ |
-| `lpm login` | Registry-Authentifizierung | ⬜ |
+| `lpm pack [<dir>]` | Verzeichnis zu einem reproduzierbaren `.lxpkg` packen | ✅ |
+| `lpm publish [<dir>]` | Paket packen und in die Registry laden | ✅ |
+| `lpm login --token=<t>` | Registry-Token in `~/.lpm/credentials` ablegen | ✅ |
+| `lpm logout` | Token wieder entfernen | ✅ |
 | `lpm resolve <pkg> [--entry]` | Import-Auflösung für `lyxc` (intern) | ✅ |
 
 Globale Optionen:

@@ -167,6 +167,19 @@ var ixLastCount: int64 := 0;
 // Liest das dependencies-Objekt einer Version. Namen und Constraints landen in
 // den uebergebenen Puffern; Rueckgabe: Position danach oder -1.
 fn ixDeps(buf: int64, i: int64, names: int64, cons: int64, countOut: int64): int64 {
+  // Ein leeres dependencies-Feld darf auch als [] ankommen. PHP serialisiert
+  // ein leeres assoziatives Array so, und daran soll nicht der ganze Index
+  // scheitern — "keine Dependencies" ist in beiden Schreibweisen dasselbe.
+  var q: int64 := ixWs(buf, i);
+  if peek8(buf + q) as int64 == 91 {
+    q := ixWs(buf, q + 1);
+    if peek8(buf + q) as int64 == 93 {
+      poke64(countOut, 0);
+      return q + 1;
+    }
+    return 0 - 1;   // eine gefuellte Liste ist hier wirklich falsch
+  }
+
   var p: int64 := ixExpect(buf, i, 123);
   if p < 0 { return 0 - 1; }
   var n: int64 := 0;

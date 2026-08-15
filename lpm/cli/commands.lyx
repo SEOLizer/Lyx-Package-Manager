@@ -23,6 +23,7 @@ import lpm.core.index;
 import lpm.core.localcat;
 import lpm.core.fetch;
 import lpm.core.pack;
+import lpm.core.credentials;
 
 // ---------------------------------------------------------------------------
 // Schreib-Hilfsfunktionen (via sys_write — kein io-Import nötig)
@@ -126,8 +127,9 @@ fn lpmHelp(): void {
   cmdOutLn("  info <pkg>             Paketdetails anzeigen"c);
   cmdOutLn("  list                   Aufgelöste Pakete aus lyx.lock anzeigen"c);
   cmdOutLn("  pack [<dir>]           Verzeichnis zu einem .lxpkg packen"c);
-  cmdOutLn("  publish                Paket in Registry hochladen"c);
-  cmdOutLn("  login                  Registry-Authentifizierung"c);
+  cmdOutLn("  publish [<dir>]        Paket packen und hochladen"c);
+  cmdOutLn("  login --token=<token>  Registry-Token hinterlegen"c);
+  cmdOutLn("  logout                 Token wieder entfernen"c);
   cmdOutLn("  resolve <pkg> [--entry] Import-Auflösung für lyxc (intern):"c);
   cmdOutLn("                         schreibt den Cache-Pfad auf stdout, mit"c);
   cmdOutLn("                         --entry die Unit-Datei darin"c);
@@ -291,6 +293,7 @@ con CMD_RES_INCOMPLETE: int64 := 2;
 con CMD_SYNC_MAX:  int64 := 64;
 con CMD_NAME_MAX:  int64 := 256;
 con CMD_PATH_MAX:  int64 := 4096;
+con CMD_JSON_DEPS_MAX: int64 := 3072;   // passt in eine Kopfzeile
 
 // Steht name schon in der Liste der in diesem Lauf versuchten Indizes?
 fn cmdSeenHas(seen: int64, n: int64, name: pchar): bool {
@@ -1407,6 +1410,217 @@ fn lpmPack(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
 }
 
 // ---------------------------------------------------------------------------
+// login / logout — Registry-Token verwalten
+// ---------------------------------------------------------------------------
+
+// Die Registry, auf die sich der Aufruf bezieht.
+fn cmdRegistry(ctx: LpmCtx): pchar {
+  var r: pchar := ctx.lcRegistry;
+  if r == 0 as pchar { r := arDefaultRegistry(); }
+  return r;
+}
+
+fn lpmLogin(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var token: pchar := ctx.LcFlagVal("--token"c);
+  if token == 0 as pchar { token := ctx.LcSubArg(0); }
+  if token == 0 as pchar {
+    cmdErr("Verwendung: lpm login --token=<token> [--registry=<url>]"c);
+    cmdOutLn("     Den Token stellt der Registry-Betreiber aus."c);
+    return 1;
+  }
+  if StrLen(token) >= CR_TOKEN_MAX {
+    cmdErr("Token zu lang."c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  var registry: pchar := cmdRegistry(ctx);
+
+  if !CrStore(home, registry, token) {
+    cmdErr("Token liess sich nicht speichern (~/.lpm/credentials)."c);
+    return 1;
+  }
+
+  // Der Token selbst wird nicht ausgegeben — auch nicht gekuerzt. Wer ihn
+  // sehen will, liest die Datei; wer ein Protokoll teilt, teilt ihn nicht mit.
+  cmdOut("lpm: angemeldet an "c); cmdOutLn(registry);
+  cmdOutLn("     Token in ~/.lpm/credentials (nur fuer dich lesbar)."c);
+  return 0;
+}
+
+fn lpmLogout(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var home: pchar := cmdGetHome(argc, argv);
+  var registry: pchar := cmdRegistry(ctx);
+
+  if !CrForget(home, registry) {
+    cmdErr("Token liess sich nicht entfernen."c);
+    return 1;
+  }
+  cmdOut("lpm: abgemeldet von "c); cmdOutLn(registry);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// publish — ein .lxpkg in die Registry laden
+// ---------------------------------------------------------------------------
+
+// Baut aus den Dependencies des Manifests das JSON-Objekt fuer X-Lpm-Deps.
+// Die Registry kennt den Paketinhalt nicht; ohne diese Angabe stuende im Index
+// kein dependencies-Feld, und der Resolver saehe das Paket als abhaengigkeitsfrei.
+fn cmdDepsJson(mf: Manifest, out: int64, cap: int64): bool {
+  var p: int64 := 0;
+  poke8(out + p, 123); p := p + 1;   // {
+
+  var i: int64 := 0;
+  while i < mf.MfDepCount() {
+    var nm: pchar := mf.MfDepName(i);
+    var vr: pchar := mf.MfDepVer(i);
+    if p + StrLen(nm) + StrLen(vr) + 8 >= cap { return false; }
+
+    if i > 0 { poke8(out + p, 44); p := p + 1; }   // ,
+    poke8(out + p, 34); p := p + 1;
+    p := cmdWrS(out, p, nm);
+    poke8(out + p, 34); p := p + 1;
+    poke8(out + p, 58); p := p + 1;                // :
+    poke8(out + p, 34); p := p + 1;
+    p := cmdWrS(out, p, vr);
+    poke8(out + p, 34); p := p + 1;
+    i := i + 1;
+  }
+
+  if p + 2 >= cap { return false; }
+  poke8(out + p, 125); p := p + 1;   // }
+  poke8(out + p, 0);
+  return true;
+}
+
+fn lpmPublish(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  if ctx.lcOffline {
+    cmdErr("publish braucht Netzwerk, --offline ist gesetzt."c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  var registry: pchar := cmdRegistry(ctx);
+
+  var token: int64 := alloc(CR_TOKEN_MAX);
+  if !CrLoad(home, registry, token) {
+    free(token, CR_TOKEN_MAX);
+    cmdErr("nicht angemeldet — erst 'lpm login --token=<token>' ausfuehren."c);
+    return 1;
+  }
+
+  // Manifest des zu veroeffentlichenden Verzeichnisses
+  var dir: pchar := ctx.LcSubArg(0);
+  if dir == 0 as pchar { dir := "."c; }
+
+  var toml: int64 := alloc(CMD_PATH_MAX);
+  var tp: int64 := 0;
+  tp := cmdWrS(toml, tp, dir);
+  tp := cmdWrS(toml, tp, "/lyx.toml"c);
+  poke8(toml + tp, 0);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  var read: bool := false;
+  if FileExists(toml as pchar) { read := mf.MfRead(toml as pchar); }
+  free(toml, CMD_PATH_MAX);
+
+  if !read {
+    cmdErr("kein lesbares lyx.toml in diesem Verzeichnis."c);
+    mf.MfFree(); dispose mf;
+    free(token, CR_TOKEN_MAX);
+    return 1;
+  }
+
+  var pname: pchar := mf.MfName();
+  var pver:  pchar := mf.MfVersion();
+  if pname == 0 as pchar || pver == 0 as pchar {
+    cmdErr(PkErrStr(PK_ERR_MANIFEST));
+    mf.MfFree(); dispose mf;
+    free(token, CR_TOKEN_MAX);
+    return 1;
+  }
+
+  // Immer frisch packen statt ein herumliegendes Archiv zu nehmen: sonst laedt
+  // man irgendwann den Stand von vorgestern hoch, ohne es zu merken.
+  var fname: int64 := alloc(CMD_PATH_MAX);
+  PkArchiveName(pname, pver, fname, CMD_PATH_MAX);
+  var archive: int64 := alloc(CMD_PATH_MAX);
+  var ap: int64 := 0;
+  ap := cmdWrS(archive, ap, dir);
+  ap := cmdWrS(archive, ap, "/"c);
+  ap := cmdWrS(archive, ap, fname as pchar);
+  poke8(archive + ap, 0);
+  free(fname, CMD_PATH_MAX);
+
+  var sha: int64 := alloc(65);
+  var prc: int64 := PkBuild(dir, archive as pchar, sha);
+  if prc != PK_OK {
+    cmdErr(PkErrStr(prc));
+    free(sha, 65); free(archive, CMD_PATH_MAX);
+    mf.MfFree(); dispose mf;
+    free(token, CR_TOKEN_MAX);
+    return 1;
+  }
+
+  var deps: int64 := alloc(CMD_JSON_DEPS_MAX);
+  if !cmdDepsJson(mf, deps, CMD_JSON_DEPS_MAX) {
+    cmdErr("zu viele Dependencies fuer eine Kopfzeile."c);
+    free(deps, CMD_JSON_DEPS_MAX);
+    free(sha, 65); free(archive, CMD_PATH_MAX);
+    mf.MfFree(); dispose mf;
+    free(token, CR_TOKEN_MAX);
+    return 1;
+  }
+
+  cmdOut("lpm: veroeffentliche "c); cmdOut(pname); cmdOut("@"c); cmdOut(pver);
+  cmdOut(" an "c); cmdOutLn(registry);
+  if ctx.lcVerbose {
+    cmdOut("     "c); cmdOutLn(archive as pchar);
+    cmdOut("     sha256 "c); cmdOutLn(sha as pchar);
+  }
+
+  var statusBox: int64 := alloc(8);
+  var reply: int64 := alloc(FT_REPLY_MAX);
+  var rc: int64 := FtPublish(registry, token as pchar, pname, pver,
+                             sha as pchar, deps as pchar, mf.MfDesc(),
+                             archive as pchar, statusBox, reply);
+  var status: int64 := peek64(statusBox);
+  free(statusBox, 8);
+
+  if rc != FT_OK {
+    cmdOut("lpm: error: "c); cmdOutLn(FtErrStr(rc));
+    if status > 0 {
+      cmdOut("     HTTP "c); cmdOutInt(status); cmdOutLn(""c);
+    }
+    // Die Antwort der Registry ist meist genauer als alles, was der Client
+    // daraus schliessen koennte — deshalb unveraendert weiterreichen.
+    if peek8(reply) as int64 != 0 {
+      cmdOutLn("     Antwort der Registry:"c);
+      cmdOutLn(reply as pchar);
+    }
+    free(reply, FT_REPLY_MAX);
+    free(deps, CMD_JSON_DEPS_MAX);
+    free(sha, 65); free(archive, CMD_PATH_MAX);
+    mf.MfFree(); dispose mf;
+    free(token, CR_TOKEN_MAX);
+    return 1;
+  }
+
+  cmdOut("lpm: "c); cmdOut(pname); cmdOut("@"c); cmdOut(pver);
+  cmdOutLn(" ist veroeffentlicht."c);
+  cmdOut("     sha256 "c); cmdOutLn(sha as pchar);
+
+  free(reply, FT_REPLY_MAX);
+  free(deps, CMD_JSON_DEPS_MAX);
+  free(sha, 65); free(archive, CMD_PATH_MAX);
+  mf.MfFree(); dispose mf;
+  free(token, CR_TOKEN_MAX);
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Stubs für netzwerkabhängige Befehle
 // ---------------------------------------------------------------------------
 
@@ -1436,8 +1650,9 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if StrCmp(cmd, "info"c)    == 0 { return lpmInfo(ctx, argc, argv); }
   if StrCmp(cmd, "list"c)    == 0 { return lpmList(argc, argv); }
   if StrCmp(cmd, "pack"c)    == 0 { return lpmPack(ctx, argc, argv); }
-  if StrCmp(cmd, "publish"c) == 0 { return lpmNotImpl("publish"c); }
-  if StrCmp(cmd, "login"c)   == 0 { return lpmNotImpl("login"c); }
+  if StrCmp(cmd, "publish"c) == 0 { return lpmPublish(ctx, argc, argv); }
+  if StrCmp(cmd, "login"c)   == 0 { return lpmLogin(ctx, argc, argv); }
+  if StrCmp(cmd, "logout"c)  == 0 { return lpmLogout(ctx, argc, argv); }
   if StrCmp(cmd, "resolve"c) == 0 { return lpmResolve(ctx, argc, argv); }
 
   if StrCmp(cmd, "cache"c) == 0 {

@@ -211,6 +211,7 @@ pub type Manifest = class {
   pub fn MfName():    pchar { return self.mName; }
   pub fn MfVersion(): pchar { return self.mVersion; }
   pub fn MfEntry():   pchar { return self.mEntry; }
+  pub fn MfDesc():    pchar { return self.mDesc; }
 
   pub fn MfDepCount(): int64 { return self.mDepCount; }
 

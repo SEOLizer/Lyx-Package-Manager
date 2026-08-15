@@ -14,6 +14,7 @@ SRCS := main.lyx \
         lpm/core/localcat.lyx \
         lpm/core/fetch.lyx \
         lpm/core/pack.lyx \
+        lpm/core/credentials.lyx \
         lpm/cli/args.lyx \
         lpm/cli/commands.lyx
 

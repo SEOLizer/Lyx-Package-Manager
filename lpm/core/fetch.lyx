@@ -38,6 +38,9 @@ pub con FT_ERR_404:   int64 := 0 - 3;   // Paket bzw. Index existiert nicht
 pub con FT_ERR_HTTP:  int64 := 0 - 4;   // anderer 4xx/5xx-Status
 pub con FT_ERR_LIMIT: int64 := 0 - 5;   // Antwort groesser als FT_BODY_MAX
 pub con FT_ERR_WRITE: int64 := 0 - 6;   // Spiegel liess sich nicht schreiben
+pub con FT_ERR_AUTH:  int64 := 0 - 7;   // Token fehlt, unbekannt oder unbefugt
+pub con FT_ERR_EXISTS:int64 := 0 - 8;   // Version ist bereits veroeffentlicht
+pub con FT_ERR_READ:  int64 := 0 - 9;   // lokale Datei nicht lesbar
 
 con FT_PATH_MAX: int64 := 4096;
 con FT_HOST_MAX: int64 := 256;
@@ -47,6 +50,9 @@ con FT_ARCHIVE_MAX: int64 := 67108864;  // 64 MiB — Grenze fuer ein .lxpkg,
 con FT_DIR_MODE: int64 := 493;       // 0755
 con FT_ETAG_MAX: int64 := 256;
 con FT_TTL_SECS: int64 := 3600;      // 1 h, siehe docs/registry.md
+con FT_HEADER_MAX: int64 := 4096;
+con FT_UPLOAD_MAX: int64 := 33554432;   // 32 MiB, wie client_max_body_size
+pub con FT_REPLY_MAX: int64 := 4096;    // Antwortrumpf beim Upload
 
 // ---------------------------------------------------------------------------
 // Pfad-Helfer (bewusst dieselbe Form wie in cache.lyx und localcat.lyx)
@@ -598,6 +604,135 @@ pub fn FtDownloadArchive(home: pchar, registry: pchar, name: pchar,
   return FT_OK;
 }
 
+// ---------------------------------------------------------------------------
+// Upload (WP-PM-08)
+// ---------------------------------------------------------------------------
+
+// Laedt ein .lxpkg an POST <registry>/api/v1/publish hoch.
+//
+// Der Rumpf ist das rohe Archiv, alles andere steht in Kopfzeilen — so muss
+// der Client keine multipart-Kodierung bauen. Der Token geht als
+// `Authorization: Bearer`, deshalb wird hier HTTPSSend statt HTTPSPost
+// benutzt: letzteres kann keine eigenen Kopfzeilen setzen.
+//
+// deps ist ein JSON-Objekt als Text ("{}" wenn keine), desc darf leer sein.
+// *statusOut bekommt den HTTP-Status, *bodyOut (FT_REPLY_MAX) die Antwort —
+// die Fehlermeldung der Registry ist fuer den Anwender oft nuetzlicher als
+// jeder Text, den der Client sich ausdenken koennte.
+pub fn FtPublish(registry: pchar, token: pchar, name: pchar, version: pchar,
+                 sha256: pchar, deps: pchar, desc: pchar,
+                 archivePath: pchar, statusOut: int64, bodyOut: int64): int64 {
+  poke64(statusOut, 0);
+  poke8(bodyOut, 0);
+
+  if !FtNameIsSafe(name) { return FT_ERR_URL; }
+  if !FtVersionIsSafe(version) { return FT_ERR_URL; }
+  if !ftUrlOk(registry) { return FT_ERR_URL; }
+  if token == 0 as pchar { return FT_ERR_AUTH; }
+  if StrLen(token) == 0 { return FT_ERR_AUTH; }
+
+  var size: int64 := FileSize(archivePath);
+  if size <= 0 { return FT_ERR_READ; }
+  if size > FT_UPLOAD_MAX { return FT_ERR_LIMIT; }
+
+  var body: int64 := alloc(size + 1);
+  var got: int64 := ReadFile(archivePath, body as pchar, size);
+  if got != size {
+    free(body, size + 1);
+    return FT_ERR_READ;
+  }
+
+  var host: int64 := alloc(FT_HOST_MAX);
+  var baseOff: int64 := ftSplitUrl(registry, host);
+
+  var path: int64 := alloc(FT_PATH_MAX);
+  var p: int64 := 0;
+  p := ftAppend(path, p, (registry as int64 + baseOff) as pchar);
+  p := ftAppend(path, p, "/api/v1/publish"c);
+  ftEnd(path, p);
+
+  // Kopfzeilen. Jede endet mit CRLF; der HTTP-Client haengt sie unveraendert
+  // an und prueft sie auf eingeschmuggelte Zeilenumbrueche.
+  var hdr: int64 := alloc(FT_HEADER_MAX);
+  var h: int64 := 0;
+  h := ftAppend(hdr, h, "Authorization: Bearer "c);
+  h := ftAppend(hdr, h, token);
+  h := ftCrLf(hdr, h);
+  h := ftAppend(hdr, h, "Content-Type: application/octet-stream"c);
+  h := ftCrLf(hdr, h);
+  h := ftAppend(hdr, h, "X-Lpm-Name: "c);
+  h := ftAppend(hdr, h, name);
+  h := ftCrLf(hdr, h);
+  h := ftAppend(hdr, h, "X-Lpm-Version: "c);
+  h := ftAppend(hdr, h, version);
+  h := ftCrLf(hdr, h);
+  if sha256 != 0 as pchar {
+    if StrLen(sha256) > 0 {
+      h := ftAppend(hdr, h, "X-Lpm-Sha256: "c);
+      h := ftAppend(hdr, h, sha256);
+      h := ftCrLf(hdr, h);
+    }
+  }
+  if deps != 0 as pchar {
+    if StrLen(deps) > 0 {
+      h := ftAppend(hdr, h, "X-Lpm-Deps: "c);
+      h := ftAppend(hdr, h, deps);
+      h := ftCrLf(hdr, h);
+    }
+  }
+  if desc != 0 as pchar {
+    if StrLen(desc) > 0 {
+      h := ftAppend(hdr, h, "X-Lpm-Desc: "c);
+      h := ftAppend(hdr, h, desc);
+      h := ftCrLf(hdr, h);
+    }
+  }
+  ftEnd(hdr, h);
+
+  var req: HTTPRequest;
+  req.method   := HTTP_POST;
+  req.host     := host;
+  req.path     := path;
+  req.port     := 443;
+  req.headers  := hdr;
+  req.body     := body;
+  req.bodySize := size;
+
+  var resp: HTTPResponse := HTTPSSend(req);
+
+  free(hdr, FT_HEADER_MAX);
+  free(path, FT_PATH_MAX);
+  free(host, FT_HOST_MAX);
+  free(body, size + 1);
+
+  poke64(statusOut, resp.statusCode);
+
+  if resp.bodyPtr != 0 {
+    var n: int64 := resp.bodySize;
+    if n > FT_REPLY_MAX - 1 { n := FT_REPLY_MAX - 1; }
+    memcpy(bodyOut, resp.bodyPtr, n);
+    poke8(bodyOut + n, 0);
+  }
+
+  var code: int64 := resp.statusCode;
+  HTTPResponseFree(resp);
+
+  if code == 0 { return FT_ERR_NET; }
+  if code == 200 { return FT_OK; }
+  if code == 201 { return FT_OK; }
+  if code == 401 { return FT_ERR_AUTH; }
+  if code == 403 { return FT_ERR_AUTH; }
+  if code == 409 { return FT_ERR_EXISTS; }
+  return FT_ERR_HTTP;
+}
+
+// Haengt CRLF an.
+fn ftCrLf(buf: int64, pos: int64): int64 {
+  poke8(buf + pos, 13);
+  poke8(buf + pos + 1, 10);
+  return pos + 2;
+}
+
 // Gibt einen von FtDownloadArchive gelieferten Pfad frei.
 pub fn FtFreePath(p: int64): void {
   if p != 0 { free(p, FT_PATH_MAX); }
@@ -695,5 +830,8 @@ pub fn FtErrStr(code: int64): pchar {
   if code == FT_ERR_HTTP   { return "Registry meldet einen Fehlerstatus"c; }
   if code == FT_ERR_LIMIT  { return "Antwort der Registry zu gross"c; }
   if code == FT_ERR_WRITE  { return "Spiegel liess sich nicht schreiben"c; }
+  if code == FT_ERR_AUTH   { return "nicht angemeldet oder nicht berechtigt (lpm login)"c; }
+  if code == FT_ERR_EXISTS { return "diese Version ist bereits veroeffentlicht"c; }
+  if code == FT_ERR_READ   { return "Archiv liess sich nicht lesen"c; }
   return "unbekannter Fehler"c;
 }
