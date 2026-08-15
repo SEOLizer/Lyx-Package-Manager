@@ -298,3 +298,194 @@ pub fn LpmArchiveErrStr(code: int64): pchar {
   if code == LPA_ERR_HASH  { return "SHA256 stimmt nicht"c; }
   return "unbekannter Fehler"c;
 }
+
+// ---------------------------------------------------------------------------
+// FILES.sha256 pruefen (WP-PM-10, Vorstufe)
+// ---------------------------------------------------------------------------
+//
+// Jedes von `lpm pack` gebaute Paket traegt ein FILES.sha256 mit einer Zeile
+// je Datei:
+//
+//   a372f245…bd06  base.lyx
+//   e1bdbfe3…8673  lyx.toml
+//
+// Bis hierher war das eine Beilage ohne Leser. Der sha256 in lyx.lock deckt
+// nur den Weg vom Server bis in den Cache ab — was danach im Cache passiert,
+// sah niemand: eine geaenderte Datei unter ~/.lpm/cache wurde bei jedem
+// weiteren Lauf klaglos benutzt, weil LpmCacheHas ausschliesslich prueft, ob
+// das Verzeichnis existiert.
+//
+// Diese Pruefung schliesst die Luecke fuer alles, was `lpm pack` erzeugt hat.
+// Sie ersetzt keine Signatur: FILES.sha256 liegt im selben Archiv wie die
+// Dateien, wer beides aendern kann, aendert eben beides. Gegen das versehent-
+// liche Bearbeiten im Cache und gegen halb entpackte Pakete hilft sie
+// trotzdem — und das sind die Faelle, die im Alltag vorkommen.
+
+pub con LPA_VERIFY_OK:      int64 := 0;
+pub con LPA_VERIFY_NOLIST:  int64 := 1;        // kein FILES.sha256 vorhanden
+pub con LPA_VERIFY_FAILED:  int64 := 0 - 20;   // mindestens eine Datei weicht ab
+pub con LPA_VERIFY_MISSING: int64 := 0 - 21;   // eine gelistete Datei fehlt
+pub con LPA_VERIFY_BROKEN:  int64 := 0 - 22;   // FILES.sha256 unlesbar
+
+con LPA_LIST_MAX: int64 := 1048576;   // 1 MiB Dateiliste reicht fuer 15000 Zeilen
+
+// Name der zuletzt beanstandeten Datei — der Aufrufer will sagen koennen,
+// welche es war, ohne die Liste selbst zu lesen.
+var lpaBadFile: int64 := 0;
+
+pub fn LpaVerifyBadFile(): pchar {
+  if lpaBadFile == 0 { return ""c; }
+  return lpaBadFile as pchar;
+}
+
+fn lpaSetBadFile(buf: int64, start: int64, len: int64): void {
+  if lpaBadFile == 0 { lpaBadFile := alloc(LPA_PATH_MAX); }
+  var n: int64 := len;
+  if n > LPA_PATH_MAX - 1 { n := LPA_PATH_MAX - 1; }
+  memcpy(lpaBadFile, buf + start, n);
+  poke8(lpaBadFile + n, 0);
+}
+
+// Prueft alle in <dir>/FILES.sha256 gelisteten Dateien.
+//
+// Rueckgabe:
+//   LPA_VERIFY_OK       alles stimmt
+//   LPA_VERIFY_NOLIST   keine Liste vorhanden — kein Fehler, sondern ein
+//                       aelteres Paket; der Aufrufer entscheidet
+//   LPA_VERIFY_FAILED / _MISSING / _BROKEN mit LpaVerifyBadFile()
+pub fn LpmVerifyPackage(dir: pchar): int64 {
+  var listPath: int64 := alloc(LPA_PATH_MAX);
+  var lp: int64 := 0;
+  var dl: int64 := StrLen(dir);
+  memcpy(listPath, dir as int64, dl);
+  lp := dl;
+  memcpy(listPath + lp, "/FILES.sha256"c as int64, 13);
+  lp := lp + 13;
+  poke8(listPath + lp, 0);
+
+  if !FileExists(listPath as pchar) {
+    free(listPath, LPA_PATH_MAX);
+    return LPA_VERIFY_NOLIST;
+  }
+
+  var size: int64 := FileSize(listPath as pchar);
+  if size <= 0 {
+    free(listPath, LPA_PATH_MAX);
+    return LPA_VERIFY_BROKEN;
+  }
+  if size > LPA_LIST_MAX {
+    free(listPath, LPA_PATH_MAX);
+    return LPA_VERIFY_BROKEN;
+  }
+
+  var buf: int64 := alloc(size + 1);
+  var got: int64 := ReadFile(listPath as pchar, buf as pchar, size);
+  free(listPath, LPA_PATH_MAX);
+  if got <= 0 {
+    free(buf, size + 1);
+    return LPA_VERIFY_BROKEN;
+  }
+  poke8(buf + got, 0);
+
+  var rc: int64 := LPA_VERIFY_OK;
+  var i: int64 := 0;
+
+  while i < got {
+    // Zeilenende suchen
+    var lineStart: int64 := i;
+    var lineEnd: int64 := i;
+    while lineEnd < got {
+      if peek8(buf + lineEnd) as int64 == 10 { break; }
+      lineEnd := lineEnd + 1;
+    }
+
+    var len: int64 := lineEnd - lineStart;
+    if len > 66 {
+      // "<64 Hex>  <pfad>" — zwei Leerzeichen als Trenner, wie sha256sum.
+      var nameStart: int64 := lineStart + 66;
+      var nameLen: int64 := lineEnd - nameStart;
+
+      // Der Pfad kommt aus dem Archiv und darf nicht aus dem Paket
+      // herausfuehren. lpaNameSafe hat das beim Entpacken schon geprueft;
+      // hier zaehlt, dass eine manipulierte Liste nicht dazu verleitet,
+      // fremde Dateien zu lesen.
+      var safe: bool := true;
+      if peek8(buf + nameStart) as int64 == 47 { safe := false; }
+      var k: int64 := 0;
+      while k + 1 < nameLen {
+        if peek8(buf + nameStart + k) as int64 == 46 {
+          if peek8(buf + nameStart + k + 1) as int64 == 46 { safe := false; break; }
+        }
+        k := k + 1;
+      }
+
+      if !safe {
+        lpaSetBadFile(buf, nameStart, nameLen);
+        rc := LPA_VERIFY_BROKEN;
+        break;
+      }
+
+      var full: int64 := alloc(LPA_PATH_MAX);
+      memcpy(full, dir as int64, dl);
+      poke8(full + dl, 47);
+      var base: int64 := dl + 1;
+      if base + nameLen >= LPA_PATH_MAX {
+        free(full, LPA_PATH_MAX);
+        lpaSetBadFile(buf, nameStart, nameLen);
+        rc := LPA_VERIFY_BROKEN;
+        break;
+      }
+      memcpy(full + base, buf + nameStart, nameLen);
+      poke8(full + base + nameLen, 0);
+
+      if !FileExists(full as pchar) {
+        free(full, LPA_PATH_MAX);
+        lpaSetBadFile(buf, nameStart, nameLen);
+        rc := LPA_VERIFY_MISSING;
+        break;
+      }
+
+      var got2: int64 := alloc(65);
+      var readOk: bool := LpaSha256File(full as pchar, got2);
+      free(full, LPA_PATH_MAX);
+
+      if !readOk {
+        free(got2, 65);
+        lpaSetBadFile(buf, nameStart, nameLen);
+        rc := LPA_VERIFY_MISSING;
+        break;
+      }
+
+      var same: bool := true;
+      var h: int64 := 0;
+      while h < 64 {
+        if peek8(got2 + h) as int64 != peek8(buf + lineStart + h) as int64 {
+          same := false;
+          break;
+        }
+        h := h + 1;
+      }
+      free(got2, 65);
+
+      if !same {
+        lpaSetBadFile(buf, nameStart, nameLen);
+        rc := LPA_VERIFY_FAILED;
+        break;
+      }
+    }
+
+    i := lineEnd + 1;
+  }
+
+  free(buf, size + 1);
+  return rc;
+}
+
+pub fn LpmVerifyErrStr(code: int64): pchar {
+  if code == LPA_VERIFY_OK      { return "unveraendert"c; }
+  if code == LPA_VERIFY_NOLIST  { return "kein FILES.sha256 im Paket"c; }
+  if code == LPA_VERIFY_FAILED  { return "Datei im Cache wurde veraendert"c; }
+  if code == LPA_VERIFY_MISSING { return "Datei im Cache fehlt"c; }
+  if code == LPA_VERIFY_BROKEN  { return "FILES.sha256 ist unbrauchbar"c; }
+  return "unbekannter Fehler"c;
+}

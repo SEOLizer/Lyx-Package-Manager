@@ -28,6 +28,7 @@ import lpm.core.dirent;
 import lpm.core.manifest;
 import lpm.core.resolver;
 import lpm.core.index;
+import lpm.core.archive;
 
 con LC_PATH_MAX: int64 := 4096;
 con LC_JSON_MAX: int64 := 262144;
@@ -66,10 +67,30 @@ fn lcIsVersionDir(name: pchar): bool {
 // Cache -> Katalog
 // ---------------------------------------------------------------------------
 
+// Zaehlt die Pakete, die der letzte LcFromCache-Lauf wegen einer
+// fehlgeschlagenen Integritaetspruefung uebersprungen hat.
+var lcSkipped: int64 := 0;
+
+pub fn LcVerifySkipped(): int64 { return lcSkipped; }
+
 // Nimmt eine gecachte Paket-Version auf. Dependencies kommen aus deren
 // lyx.toml; fehlt sie, wird die Version trotzdem aufgenommen (ein Paket ohne
 // Dependencies ist zulaessig) — nur eben ohne Kanten.
 fn lcAddCached(cat: DepCatalog, name: pchar, ver: pchar, dirPath: int64): int64 {
+  // Vorher pruefen, ob das Paket noch das ist, was entpackt wurde.
+  //
+  // Die Pruefung steht hier und nicht erst beim Benutzen, weil ein Eintrag aus
+  // dem Cache keinen sha256 traegt (siehe unten) und damit den Eintrag aus dem
+  // Registry-Index verdraengen wuerde — samt dessen Pruefsumme. Ein
+  // beschaedigtes Paket wuerde so nicht nur benutzt, es waere danach auch nicht
+  // mehr nachladbar. Uebersprungen heisst: der Resolver sieht die Version aus
+  // dem Index und laedt sie neu.
+  var vrc: int64 := LpmVerifyPackage(dirPath as pchar);
+  if vrc < 0 {
+    lcSkipped := lcSkipped + 1;
+    return 0;
+  }
+
   // source zeigt auf das lokale Verzeichnis: ein Paket aus dem Cache muss
   // nicht erneut heruntergeladen werden.
   var pv: int64 := cat.DcAddPkg(name, ver, ""c, dirPath as pchar);
@@ -155,6 +176,7 @@ fn lcWalk(cat: DepCatalog, dirPath: int64, relName: int64, relLen: int64, depth:
 // Nimmt alle entpackten Pakete unter cacheDir in den Katalog auf.
 // Rueckgabe: Anzahl aufgenommener Paket-Versionen.
 pub fn LcFromCache(cacheDir: pchar, cat: DepCatalog): int64 {
+  lcSkipped := 0;
   if !IsDirectory(cacheDir) { return 0; }
   var root: int64 := alloc(LC_PATH_MAX);
   var p: int64 := lcAppend(root, 0, cacheDir);

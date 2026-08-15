@@ -354,6 +354,18 @@ fn cmdBuildCatalog(home: pchar, cat: DepCatalog, verbose: bool): void {
   var fromIndex: int64 := LcFromIndexDir(regDir, cat);
   LpmCacheFreePath(regDir);
 
+  // Beschaedigte Cache-Pakete meldet der Katalogbau; sie sind nicht im Katalog
+  // und werden deshalb gleich neu geholt.
+  // Nur unter --verbose: die Schleife weiter unten meldet dasselbe noch einmal,
+  // dort aber mit Paketname und betroffener Datei.
+  var skipped: int64 := LcVerifySkipped();
+  if skipped > 0 {
+    if verbose {
+      cmdOut("lpm: "c); cmdOutInt(skipped);
+      cmdOutLn(" Cache-Paket(e) bei der Pruefung uebersprungen."c);
+    }
+  }
+
   if verbose {
     cmdOut("lpm: Katalog: "c); cmdOutInt(fromCache);
     cmdOut(" aus dem Cache, "c); cmdOutInt(fromIndex);
@@ -416,6 +428,57 @@ fn cmdFetchPkg(ctx: LpmCtx, home: pchar, name: pchar, version: pchar,
   }
   LpmCacheFreePath(dest);
   return true;
+}
+
+// Ist das gecachte Paket noch das, was einmal entpackt wurde?
+//
+// Geprueft wird gegen das FILES.sha256 im Paket selbst. Der sha256 in lyx.lock
+// deckt nur den Weg vom Server bis in den Cache ab — danach sah bisher niemand
+// mehr hin, und eine im Cache geaenderte Datei wurde stillschweigend benutzt.
+//
+// Bei einer Abweichung wird das Paket verworfen und neu geholt: der Anwender
+// soll nicht zwischen "reparieren" und "weitermachen" waehlen muessen, wenn
+// die Registry die richtige Fassung ohnehin bereithaelt. Mit --offline geht das
+// nicht, dann bleibt nur die Meldung.
+//
+// Rueckgabe: true, wenn das Paket unveraendert im Cache liegt.
+fn cmdVerifyCached(ctx: LpmCtx, home: pchar, name: pchar, version: pchar): bool {
+  var dir: pchar := LpmCachePkgPath(home, name, version);
+  var rc: int64 := LpmVerifyPackage(dir);
+  LpmCacheFreePath(dir);
+
+  if rc == LPA_VERIFY_OK { return true; }
+
+  // Pakete aus der Zeit vor `lpm pack` haben keine Liste. Das ist kein Grund,
+  // sie abzulehnen — nur einer, es unter --verbose zu erwaehnen.
+  if rc == LPA_VERIFY_NOLIST {
+    if ctx.lcVerbose {
+      cmdOut("lpm: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+      cmdOutLn(": kein FILES.sha256, Integritaet nicht pruefbar."c);
+    }
+    return true;
+  }
+
+  cmdOut("lpm: warning: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+  cmdOut(": "c); cmdOut(LpmVerifyErrStr(rc));
+  var bad: pchar := LpaVerifyBadFile();
+  if bad != 0 as pchar {
+    if peek8(bad as int64) as int64 != 0 {
+      cmdOut(" ("c); cmdOut(bad); cmdOut(")"c);
+    }
+  }
+  cmdOutLn(""c);
+
+  if ctx.lcOffline {
+    cmdOutLn("     --offline ist gesetzt — das Paket wird nicht neu geholt."c);
+    return false;
+  }
+
+  // Verworfen wird das Verzeichnis vollstaendig; ein halb ersetztes Paket
+  // waere schlimmer als das veraenderte.
+  cmdOutLn("     wird verworfen und neu geholt."c);
+  LpmCacheDropPkg(home, name, version);
+  return false;
 }
 
 // Traegt alle Dependencies des Manifests als Wurzeln ein.
@@ -549,12 +612,18 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
   while n < r.RsCount() {
     var nm: pchar := r.RsName(n);
     var vr: pchar := r.RsVer(n);
+    var usable: bool := false;
     if LpmCacheHas(home, nm, vr) {
-      if ctx.lcVerbose {
-        cmdOut("lpm: "c); cmdOut(nm); cmdOut("@"c); cmdOut(vr);
-        cmdOutLn(" liegt im Cache."c);
+      usable := cmdVerifyCached(ctx, home, nm, vr);
+      if usable {
+        if ctx.lcVerbose {
+          cmdOut("lpm: "c); cmdOut(nm); cmdOut("@"c); cmdOut(vr);
+          cmdOutLn(" liegt im Cache."c);
+        }
       }
-    } else {
+    }
+
+    if !usable {
       var got: bool := false;
       if !ctx.lcOffline {
         var li: int64 := lock.LfFind(nm);
@@ -1258,7 +1327,16 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   var ver: int64 := alloc(CMD_NAME_MAX);
   var locked: bool := cmdLockedVersion(pkg, ver, CMD_NAME_MAX);
   if locked {
+    // Auch hier gegen FILES.sha256 pruefen: der Compiler bekommt gleich einen
+    // Pfad, aus dem er uebersetzt. Schlaegt die Pruefung an, faellt der Aufruf
+    // in die vollstaendige Aufloesung unten und holt das Paket neu.
+    var cached: bool := false;
     if LpmCacheHas(home, pkg, ver as pchar) {
+      cmdOutFd := 2;
+      cached := cmdVerifyCached(ctx, home, pkg, ver as pchar);
+      cmdOutFd := 1;
+    }
+    if cached {
       if cmdPrintCachePath(home, pkg, ver as pchar, wantEntry) {
         free(ver, CMD_NAME_MAX);
         free(name, CMD_NAME_MAX);
