@@ -59,6 +59,17 @@ LYXC   := /pfad/zu/aurum/lyxc
 AURUM  := /pfad/zu/aurum
 ```
 
+Damit `lpm` ohne Pfadangabe aufrufbar ist:
+
+```bash
+make install PREFIX=~/.local      # ohne sudo, wenn ~/.local/bin im PATH liegt
+sudo make install                 # systemweit nach /usr/local/bin
+make uninstall                    # wieder entfernen (gleiches PREFIX angeben)
+```
+
+`DESTDIR` wird beachtet, für Paketbau oder eine Installation ins Leere:
+`make install DESTDIR=/tmp/stage`.
+
 ---
 
 ## Verwendung

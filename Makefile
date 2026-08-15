@@ -27,7 +27,25 @@ bin/lpm: $(SRCS)
 clean:
 	rm -f bin/lpm
 
-.PHONY: all clean
+# Installation
+#
+# PREFIX und DESTDIR sind ueberschreibbar:
+#   make install PREFIX=$$HOME/.local     # ohne sudo, in den eigenen Pfad
+#   make install DESTDIR=/tmp/stage       # zum Paketbau, ohne das System zu beruehren
+PREFIX  ?= /usr/local
+BINDIR  ?= $(PREFIX)/bin
+DESTDIR ?=
+
+install: bin/lpm
+	install -d $(DESTDIR)$(BINDIR)
+	install -m 755 bin/lpm $(DESTDIR)$(BINDIR)/lpm
+	@echo "lpm installiert nach $(DESTDIR)$(BINDIR)/lpm"
+
+uninstall:
+	rm -f $(DESTDIR)$(BINDIR)/lpm
+	@echo "lpm aus $(DESTDIR)$(BINDIR) entfernt"
+
+.PHONY: all clean install uninstall
 
 test: bin/resolver_test bin/index_test bin/fetch_test
 	./bin/resolver_test
