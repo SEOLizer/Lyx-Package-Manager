@@ -227,6 +227,12 @@ Flache (`buffer/2.1.3`) und hierarchische (`net/http/1.2.0`) Namespaces
 existieren nebeneinander. Ein Verzeichnis gilt als Versions-Ebene, wenn sein
 Name mit einer Ziffer beginnt — dadurch kommt der Cache ohne Zusatzmetadaten aus.
 
+**Ein Paket ist immer ein Verzeichnis.** Der Manifestname `lyx.toml` liegt fest,
+zwei Manifeste nebeneinander gibt es nicht — und `lpm pack` nimmt alles aus dem
+Verzeichnis. Mehrere Units, die einzeln importierbar sein sollen, brauchen
+deshalb je ein eigenes Verzeichnis; Details und der Gegenfall stehen im
+[Handbuch](docs/handbuch.md#mehrere-units--ein-paket-oder-mehrere).
+
 ---
 
 ## Projektstruktur

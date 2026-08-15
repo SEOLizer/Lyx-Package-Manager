@@ -13,6 +13,7 @@ Die Serverseite (Registry einrichten, vhost, Token-Datei) steht in
 1. [Installieren](#1-installieren)
 2. [Ein Projekt anlegen und Pakete benutzen](#2-ein-projekt-anlegen-und-pakete-benutzen)
 3. [Ein eigenes Paket bauen](#3-ein-eigenes-paket-bauen)
+   — auch: [mehrere Units aufteilen](#mehrere-units--ein-paket-oder-mehrere)
 4. [Einen Token bekommen](#4-einen-token-bekommen)
 5. [Anmelden](#5-anmelden)
 6. [Veröffentlichen](#6-veröffentlichen)
@@ -172,6 +173,74 @@ Wer nur lokal testen will, braucht die Registry nicht:
 $ lpm cache add ./net_http-1.2.0.lxpkg net/http 1.2.0
 lpm: net/http@1.2.0 entpackt nach /home/du/.lpm/cache/net/http/1.2.0
 ```
+
+### Mehrere Units — ein Paket oder mehrere?
+
+**Ein Paket ist immer ein Verzeichnis.** Der Manifestname `lyx.toml` liegt
+fest; zwei Manifeste nebeneinander im selben Ordner gibt es nicht.
+
+Das ist mehr als eine Formalie, denn `lpm pack` nimmt **alles** aus dem
+Verzeichnis. Liegen vier Units flach beieinander:
+
+```
+demo/
+  lyx.toml        name = "demo/http", entry = "http.lyx"
+  http.lyx
+  json.lyx
+  tls.lyx
+  buffer.lyx
+```
+
+dann enthält das gebaute Archiv alle vier — `entry` wählt nicht aus, sondern
+benennt nur die Haupt-Unit:
+
+```console
+$ lpm pack && zstd -dc demo_http-1.0.0.lxpkg | tar -t
+buffer.lyx
+http.lyx
+json.lyx
+lyx.toml
+tls.lyx
+FILES.sha256
+```
+
+(Die Reihenfolge ist alphabetisch — daher steht `lyx.toml` mitten drin und
+`FILES.sha256` als Erzeugtes am Schluss.)
+
+Die Frage ist deshalb nicht „wie teile ich die Dateien auf", sondern:
+**sollen die Units einzeln importierbar sein?**
+
+**Ja — dann je ein Verzeichnis.**
+
+```
+projekte/
+  http/     lyx.toml (demo/http)     http.lyx
+  json/     lyx.toml (demo/json)     json.lyx
+  tls/      lyx.toml (demo/tls)      tls.lyx
+  buffer/   lyx.toml (demo/buffer)   buffer.lyx
+```
+
+Abhängigkeiten untereinander stehen in den jeweiligen `[dependencies]`, ganz
+normal. Veröffentlicht wird je Verzeichnis:
+
+```bash
+for d in http json tls buffer; do (cd "$d" && lpm publish); done
+```
+
+**Nein — dann ein Paket mit mehreren Dateien.** Sinnvoll, wenn `json.lyx` und
+`buffer.lyx` Innereien von `demo/http` sind und niemand sie einzeln einbinden
+soll.
+
+> **Einschränkung, die man kennen muss:** `lpm resolve` liefert pro Paket
+> genau *eine* Datei. Schreibt jemand `import demo.json`, sucht `lpm` ein
+> Paket namens `demo/json` — und findet keins, auch wenn `json.lyx` in
+> `demo/http` steckt. Mit-Units sind also nur innerhalb ihres Pakets
+> brauchbar. Für öffentlich importierbare Units führt kein Weg an einem
+> eigenen Verzeichnis vorbei.
+
+Einen Workspace-Modus, der mehrere Pakete eines Repositories gemeinsam
+verwaltet und in einem Rutsch veröffentlicht, gibt es noch nicht (WP-PM-11).
+Bis dahin ist die Schleife oben der Weg.
 
 ---
 
@@ -397,6 +466,8 @@ Ehrlichkeit an dieser Stelle spart Suchzeit:
   bereit, die Compiler-Seite fehlt (siehe `compiler-integration.md`).
 - **Keine `[dev-dependencies]`-Auswertung.** Das Feld wird geparst, aber bei
   der Auflösung nicht berücksichtigt.
+- **Kein Workspace.** Mehrere Pakete in einem Repository müssen einzeln
+  gebaut und veröffentlicht werden, je Verzeichnis ein Aufruf (WP-PM-11).
 - **Der Resolver geht greedy vor**, ohne Backtracking: er nimmt je Paket die
   höchste passende Version und nimmt eine Wahl nicht zurück, wenn sie später
   in eine Sackgasse führt. Dann kommt ein Konflikt, obwohl eine ältere
