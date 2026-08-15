@@ -10,7 +10,7 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 > die öffentliche Registry: leerer Cache → Index per HTTPS → Auflösung → Archiv
 > per HTTPS → SHA256-Prüfung → entpackt im Cache. Funktionsfähig sind `init`,
 > `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list`,
-> `update`, `search` und `info`. Es fehlen `publish`, `login` und `resolve` —
+> `update`, `search`, `info` und `resolve`. Es fehlen `publish` und `login` —
 > siehe [Roadmap](#roadmap).
 >
 > Benötigt `lyxc` ≥ 1.0.19E (HTTPS; ohne Netzwerknutzung genügt 1.0.13J).
