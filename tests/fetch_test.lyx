@@ -136,6 +136,54 @@ fn testArchiveRejected(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Upload — was ohne Server pruefbar ist
+// ---------------------------------------------------------------------------
+//
+// FtPublish prueft Name, Version, URL, Token und die Lesbarkeit des Archivs,
+// bevor es eine Verbindung aufbaut. Genau diese Reihenfolge ist hier der
+// Gegenstand: ein Aufruf mit unbrauchbaren Angaben darf nicht erst am Server
+// scheitern, und ein fehlender Token darf nicht als Netzfehler erscheinen.
+
+fn testPublishRejected(): void {
+  outLn("abgelehnte Uploads"c);
+  var home: pchar := "/nonexistent-lpm-test"c;
+  var st: int64 := alloc(8);
+  var rp: int64 := alloc(FT_REPLY_MAX);
+  var tok: pchar := "irgendein-token"c;
+  var arch: pchar := "/nonexistent-lpm-test/x.lxpkg"c;
+
+  ok("unsicherer Name"c,
+     FtPublish("https://example.org"c, tok, "../etc"c, "1.0.0"c, ""c, "{}"c, ""c,
+               arch, st, rp) == FT_ERR_URL);
+  ok("unsichere Version"c,
+     FtPublish("https://example.org"c, tok, "net/http"c, "../../x"c, ""c, "{}"c, ""c,
+               arch, st, rp) == FT_ERR_URL);
+  ok("http statt https"c,
+     FtPublish("http://example.org"c, tok, "net/http"c, "1.0.0"c, ""c, "{}"c, ""c,
+               arch, st, rp) == FT_ERR_URL);
+
+  // Ohne Token gar nicht erst losfahren: der Server wuerde mit 401 antworten,
+  // aber der Anwender soll "nicht angemeldet" lesen und nicht "Serverfehler".
+  ok("Token fehlt"c,
+     FtPublish("https://example.org"c, 0 as pchar, "net/http"c, "1.0.0"c, ""c, "{}"c, ""c,
+               arch, st, rp) == FT_ERR_AUTH);
+  ok("Token leer"c,
+     FtPublish("https://example.org"c, ""c, "net/http"c, "1.0.0"c, ""c, "{}"c, ""c,
+               arch, st, rp) == FT_ERR_AUTH);
+
+  // Erst danach das Archiv — es zu lesen kostet mehr als die Pruefungen oben.
+  ok("Archiv fehlt"c,
+     FtPublish("https://example.org"c, tok, "net/http"c, "1.0.0"c, ""c, "{}"c, ""c,
+               arch, st, rp) == FT_ERR_READ);
+
+  ok("kein Status gesetzt"c, peek64(st) == 0);
+  ok("keine Antwort gesetzt"c, peek8(rp) as int64 == 0);
+
+  free(rp, FT_REPLY_MAX);
+  free(st, 8);
+}
+
+// ---------------------------------------------------------------------------
 // Fehlertexte
 // ---------------------------------------------------------------------------
 
@@ -144,6 +192,10 @@ fn testErrStr(): void {
   ok("FT_OK"c,        StrCmp(FtErrStr(FT_OK), "ok"c) == 0);
   ok("FT_ERR_404"c,   FtErrStr(FT_ERR_404) != 0 as pchar);
   ok("FT_ERR_NET"c,   FtErrStr(FT_ERR_NET) != 0 as pchar);
+  ok("FT_ERR_AUTH"c,  FtErrStr(FT_ERR_AUTH) != 0 as pchar);
+  ok("FT_ERR_EXISTS"c, FtErrStr(FT_ERR_EXISTS) != 0 as pchar);
+  ok("FT_FRESH"c,     FtErrStr(FT_FRESH) != 0 as pchar);
+  ok("FT_NOT_MOD"c,   FtErrStr(FT_NOT_MOD) != 0 as pchar);
   ok("unbekannt"c,    FtErrStr(0 - 99) != 0 as pchar);
 }
 
@@ -157,6 +209,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testUrlRejected();
   testVersions();
   testArchiveRejected();
+  testPublishRejected();
   testErrStr();
 
   outLn(""c);

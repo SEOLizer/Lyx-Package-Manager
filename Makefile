@@ -47,10 +47,12 @@ uninstall:
 
 .PHONY: all clean install uninstall
 
-test: bin/resolver_test bin/index_test bin/fetch_test
+test: bin/resolver_test bin/index_test bin/fetch_test bin/pack_test bin/credentials_test
 	./bin/resolver_test
 	./bin/index_test
 	./bin/fetch_test
+	./bin/pack_test
+	./bin/credentials_test
 
 bin/resolver_test: tests/resolver_test.lyx lpm/core/resolver.lyx lpm/core/semver.lyx lpm/core/lockfile.lyx
 	mkdir -p bin
@@ -63,5 +65,13 @@ bin/index_test: tests/index_test.lyx lpm/core/index.lyx lpm/core/resolver.lyx lp
 bin/fetch_test: tests/fetch_test.lyx lpm/core/fetch.lyx lpm/core/cache.lyx lpm/core/dirent.lyx
 	mkdir -p bin
 	$(LYXC) tests/fetch_test.lyx -I $(ROOT) -I $(AURUM) -o bin/fetch_test
+
+bin/pack_test: tests/pack_test.lyx lpm/core/pack.lyx lpm/core/archive.lyx lpm/core/dirent.lyx lpm/core/manifest.lyx
+	mkdir -p bin
+	$(LYXC) tests/pack_test.lyx -I $(ROOT) -I $(AURUM) -o bin/pack_test
+
+bin/credentials_test: tests/credentials_test.lyx lpm/core/credentials.lyx lpm/core/cache.lyx lpm/core/dirent.lyx
+	mkdir -p bin
+	$(LYXC) tests/credentials_test.lyx -I $(ROOT) -I $(AURUM) -o bin/credentials_test
 
 .PHONY: test

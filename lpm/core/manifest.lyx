@@ -213,6 +213,41 @@ pub type Manifest = class {
   pub fn MfEntry():   pchar { return self.mEntry; }
   pub fn MfDesc():    pchar { return self.mDesc; }
 
+  // Serialisiert [dependencies] als JSON-Objekt, z.B. {"std/io":">=1.0.0"}.
+  //
+  // Gebraucht wird das beim Veroeffentlichen: die Registry kennt den
+  // Paketinhalt nicht, und ohne diese Angabe stuende im Index kein
+  // dependencies-Feld — der Resolver saehe das Paket als abhaengigkeitsfrei.
+  // Rueckgabe: false, wenn der Puffer nicht reicht (der Aufrufer packt es in
+  // eine HTTP-Kopfzeile, die nicht beliebig lang werden darf).
+  pub fn MfDepsJson(out: int64, cap: int64): bool {
+    var p: int64 := 0;
+    if cap < 3 { return false; }
+    poke8(out + p, 123); p := p + 1;          // {
+
+    var i: int64 := 0;
+    while i < self.mDepCount {
+      var nm: pchar := self.MfDepName(i);
+      var vr: pchar := self.MfDepVer(i);
+      if p + StrLen(nm) + StrLen(vr) + 8 >= cap { return false; }
+
+      if i > 0 { poke8(out + p, 44); p := p + 1; }
+      poke8(out + p, 34); p := p + 1;
+      memcpy(out + p, nm as int64, StrLen(nm)); p := p + StrLen(nm);
+      poke8(out + p, 34); p := p + 1;
+      poke8(out + p, 58); p := p + 1;
+      poke8(out + p, 34); p := p + 1;
+      memcpy(out + p, vr as int64, StrLen(vr)); p := p + StrLen(vr);
+      poke8(out + p, 34); p := p + 1;
+      i := i + 1;
+    }
+
+    if p + 2 >= cap { return false; }
+    poke8(out + p, 125); p := p + 1;          // }
+    poke8(out + p, 0);
+    return true;
+  }
+
   pub fn MfDepCount(): int64 { return self.mDepCount; }
 
   pub fn MfDepName(i: int64): pchar {

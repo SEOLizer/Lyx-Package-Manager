@@ -1,0 +1,308 @@
+// tests/pack_test.lyx
+// WP-PM-08: Tests fuer den Paket-Bauer.
+//
+// Anders als die uebrigen Testsuites braucht diese das Dateisystem: gepackt
+// wird aus echten Dateien, und ob das Ergebnis stimmt, zeigt sich erst beim
+// Wiederauspacken. Gearbeitet wird ausschliesslich unter tests-tmp/ im
+// Arbeitsverzeichnis, das am Ende wieder verschwindet. Kein Netz.
+//
+// Bauen und ausfuehren:  make test
+
+@description("lpm pack tests")
+@author("Andreas Röne")
+@copyright("2026 Andreas Röne")
+@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.exit, memory.mmap])
+unit main;
+
+import std.io grant [fs.read, fs.write];
+import std.fs grant [fs.read, fs.write, fs.create, fs.delete, fs.meta];
+import lpm.core.pack grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, memory.mmap];
+import lpm.core.archive grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, memory.mmap];
+import lpm.core.manifest grant [fs.read, fs.write];
+
+con TMP: pchar := "tests-tmp"c;
+con SRC: pchar := "tests-tmp/src"c;
+con OUT: pchar := "tests-tmp/out.lxpkg"c;
+con UNP: pchar := "tests-tmp/unpacked"c;
+
+var tsPass: int64 := 0;
+var tsFail: int64 := 0;
+
+fn out(s: pchar): void {
+  if s == 0 as pchar { sys_write(1, "(null)"c as int64, 6); return; }
+  sys_write(1, s as int64, StrLen(s));
+}
+fn outLn(s: pchar): void { out(s); sys_write(1, "\n"c as int64, 1); }
+
+fn ok(name: pchar, cond: bool): void {
+  if cond {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); outLn(name);
+  }
+}
+
+fn okStr(name: pchar, got: pchar, want: pchar): void {
+  var same: bool := false;
+  if got != 0 as pchar {
+    if StrCmp(got, want) == 0 { same := true; }
+  }
+  if same {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); out(name); out("  erwartet="c); out(want);
+    out(" bekommen="c); outLn(got);
+  }
+}
+
+fn okInt(name: pchar, got: int64, want: int64): void {
+  if got == want {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); out(name); out("  erwartet="c); PrintInt(want);
+    out(" bekommen="c); PrintInt(got); outLn(""c);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Dateisystem-Helfer fuer den Aufbau der Testdaten
+// ---------------------------------------------------------------------------
+
+fn writeFile(path: pchar, content: pchar): void {
+  WriteFile(path, content, StrLen(content));
+}
+
+// Loescht tests-tmp/ mitsamt allem, was diese Suite dort anlegt. Bewusst mit
+// bekannter Dateiliste statt rekursivem Loeschen: ein Test soll nicht die
+// Faehigkeit besitzen, ein Verzeichnis unbekannten Inhalts abzuraeumen.
+fn cleanup(): void {
+  DeleteFile("tests-tmp/unpacked/docs/readme.md"c);
+  DeleteFile("tests-tmp/unpacked/lyx.toml"c);
+  DeleteFile("tests-tmp/unpacked/base.lyx"c);
+  DeleteFile("tests-tmp/unpacked/FILES.sha256"c);
+  Rmdir("tests-tmp/unpacked/docs"c);
+  Rmdir("tests-tmp/unpacked"c);
+
+  DeleteFile("tests-tmp/src/docs/readme.md"c);
+  DeleteFile("tests-tmp/src/lyx.toml"c);
+  DeleteFile("tests-tmp/src/base.lyx"c);
+  DeleteFile("tests-tmp/src/lyx.lock"c);
+  DeleteFile("tests-tmp/src/.hidden"c);
+  DeleteFile("tests-tmp/src/alt.lxpkg"c);
+  DeleteFile("tests-tmp/src/bin/junk"c);
+  Rmdir("tests-tmp/src/bin"c);
+  Rmdir("tests-tmp/src/docs"c);
+  Rmdir("tests-tmp/src"c);
+
+  DeleteFile("tests-tmp/out.lxpkg"c);
+  DeleteFile("tests-tmp/out2.lxpkg"c);
+  DeleteFile("tests-tmp/empty/lyx.toml"c);
+  Rmdir("tests-tmp/empty"c);
+  Rmdir(TMP);
+}
+
+// Legt ein Paketverzeichnis an: drei Dateien, die hineingehoeren, und vier,
+// die draussen bleiben muessen.
+fn buildSource(): void {
+  Mkdir(TMP, 493);
+  Mkdir(SRC, 493);
+  Mkdir("tests-tmp/src/docs"c, 493);
+  Mkdir("tests-tmp/src/bin"c, 493);
+
+  writeFile("tests-tmp/src/lyx.toml"c,
+            "[package]\nname = \"demo/base\"\nversion = \"1.0.0\"\n\n[build]\nentry = \"base.lyx\"\n"c);
+  writeFile("tests-tmp/src/base.lyx"c, "unit demo.base;\n"c);
+  writeFile("tests-tmp/src/docs/readme.md"c, "# demo/base\n"c);
+
+  // gehoeren NICHT ins Archiv
+  writeFile("tests-tmp/src/lyx.lock"c, "lock des anwenders\n"c);
+  writeFile("tests-tmp/src/.hidden"c, "versteckt\n"c);
+  writeFile("tests-tmp/src/alt.lxpkg"c, "altes archiv\n"c);
+  writeFile("tests-tmp/src/bin/junk"c, "gebautes\n"c);
+}
+
+// ---------------------------------------------------------------------------
+// Archivname
+// ---------------------------------------------------------------------------
+
+fn testArchiveName(): void {
+  outLn("Archivname"c);
+  var buf: int64 := alloc(256);
+
+  ok("hierarchisch"c, PkArchiveName("net/http"c, "1.2.0"c, buf, 256));
+  okStr("Slash wird Unterstrich"c, buf as pchar, "net_http-1.2.0.lxpkg"c);
+
+  PkArchiveName("buffer"c, "2.1.3"c, buf, 256);
+  okStr("flach"c, buf as pchar, "buffer-2.1.3.lxpkg"c);
+
+  PkArchiveName("std/net/tls"c, "0.1.0-rc.1"c, buf, 256);
+  okStr("drei Ebenen, prerelease"c, buf as pchar, "std_net_tls-0.1.0-rc.1.lxpkg"c);
+
+  ok("zu langer Name faellt auf"c, !PkArchiveName("net/http"c, "1.2.0"c, buf, 8));
+
+  free(buf, 256);
+}
+
+// ---------------------------------------------------------------------------
+// Packen
+// ---------------------------------------------------------------------------
+
+fn testBuild(): void {
+  outLn("packen"c);
+  buildSource();
+
+  var sha1: int64 := alloc(65);
+  var rc: int64 := PkBuild(SRC, OUT, sha1);
+  okInt("PkBuild meldet Erfolg"c, rc, PK_OK);
+  ok("Archiv existiert"c, FileExists(OUT));
+  ok("Archiv ist nicht leer"c, FileSize(OUT) > 0);
+  okInt("sha256 ist 64 Zeichen lang"c, StrLen(sha1 as pchar), 64);
+
+  // Das temporaere .tar darf nicht liegenbleiben.
+  ok("kein .tar-Rest"c, !FileExists("tests-tmp/out.lxpkg.tar"c));
+
+  // Reproduzierbarkeit: derselbe Baum, zweiter Lauf, gleicher Hash. Das ist
+  // der eigentliche Grund fuer den Befehl — ohne diese Zusicherung waere der
+  // sha256 in lyx.lock nur eine Momentaufnahme.
+  var sha2: int64 := alloc(65);
+  var rc2: int64 := PkBuild(SRC, "tests-tmp/out2.lxpkg"c, sha2);
+  okInt("zweiter Lauf erfolgreich"c, rc2, PK_OK);
+  okStr("gleicher sha256"c, sha2 as pchar, sha1 as pchar);
+  okInt("gleiche Groesse"c, FileSize("tests-tmp/out2.lxpkg"c), FileSize(OUT));
+
+  free(sha2, 65);
+  free(sha1, 65);
+}
+
+// ---------------------------------------------------------------------------
+// Inhalt: was drin sein muss und was nicht
+// ---------------------------------------------------------------------------
+
+fn testContents(): void {
+  outLn("Archivinhalt"c);
+
+  var n: int64 := LpmUnpackLxpkg(OUT, UNP);
+  ok("entpacken gelingt"c, n > 0);
+
+  ok("lyx.toml ist dabei"c,     FileExists("tests-tmp/unpacked/lyx.toml"c));
+  ok("Quelldatei ist dabei"c,   FileExists("tests-tmp/unpacked/base.lyx"c));
+  ok("Unterverzeichnis ist dabei"c, FileExists("tests-tmp/unpacked/docs/readme.md"c));
+  ok("FILES.sha256 wird erzeugt"c,  FileExists("tests-tmp/unpacked/FILES.sha256"c));
+
+  // Die Ausschluesse sind kein Schoenheitsfehler: lyx.lock gehoert dem
+  // Anwender, bin/ dem Arbeitsplatz, und ein altes Archiv im neuen waere
+  // schlicht Unsinn.
+  ok("lyx.lock bleibt draussen"c,   !FileExists("tests-tmp/unpacked/lyx.lock"c));
+  ok("versteckte Datei bleibt draussen"c, !FileExists("tests-tmp/unpacked/.hidden"c));
+  ok("altes Archiv bleibt draussen"c,     !FileExists("tests-tmp/unpacked/alt.lxpkg"c));
+  ok("bin/ bleibt draussen"c,             !FileExists("tests-tmp/unpacked/bin/junk"c));
+
+  okInt("genau vier Dateien"c, n, 4);
+
+  // FILES.sha256 muss jede eingepackte Datei nennen, sonst ist sie wertlos.
+  var size: int64 := FileSize("tests-tmp/unpacked/FILES.sha256"c);
+  ok("FILES.sha256 ist nicht leer"c, size > 0);
+  if size > 0 {
+    var buf: int64 := alloc(size + 1);
+    var got: int64 := ReadFile("tests-tmp/unpacked/FILES.sha256"c, buf as pchar, size);
+    poke8(buf + got, 0);
+    // drei Nutzdateien, je eine Zeile mit 64 Hexzeichen
+    var lines: int64 := 0;
+    var i: int64 := 0;
+    while i < got {
+      if peek8(buf + i) as int64 == 10 { lines := lines + 1; }
+      i := i + 1;
+    }
+    okInt("drei Zeilen in FILES.sha256"c, lines, 3);
+    free(buf, size + 1);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Fehlerfaelle
+// ---------------------------------------------------------------------------
+
+fn testErrors(): void {
+  outLn("Fehlerfaelle"c);
+
+  // Ein Verzeichnis ohne einpackbare Datei. lyx.toml zaehlt mit, deshalb ist
+  // hier ein wirklich leeres Verzeichnis noetig.
+  Mkdir("tests-tmp/empty"c, 493);
+  var sha: int64 := alloc(65);
+  okInt("leeres Verzeichnis"c,
+        PkBuild("tests-tmp/empty"c, "tests-tmp/leer.lxpkg"c, sha), PK_ERR_EMPTY);
+  ok("kein Archiv angelegt"c, !FileExists("tests-tmp/leer.lxpkg"c));
+
+  okInt("Verzeichnis gibt es nicht"c,
+        PkBuild("tests-tmp/gibtsnicht"c, "tests-tmp/x.lxpkg"c, sha), PK_ERR_EMPTY);
+
+  free(sha, 65);
+
+  outLn("Fehlertexte"c);
+  ok("PK_OK"c,         StrCmp(PkErrStr(PK_OK), "ok"c) == 0);
+  ok("PK_ERR_EMPTY"c,  PkErrStr(PK_ERR_EMPTY) != 0 as pchar);
+  ok("PK_ERR_NOTOML"c, PkErrStr(PK_ERR_NOTOML) != 0 as pchar);
+  ok("unbekannt"c,     PkErrStr(0 - 99) != 0 as pchar);
+}
+
+// ---------------------------------------------------------------------------
+// Dependencies als JSON — so gehen sie beim Veroeffentlichen an die Registry
+// ---------------------------------------------------------------------------
+
+fn testDepsJson(): void {
+  outLn("Dependencies als JSON"c);
+  var buf: int64 := alloc(1024);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  ok("ohne Dependencies"c, mf.MfDepsJson(buf, 1024));
+  okStr("leeres Objekt"c, buf as pchar, "{}"c);
+
+  mf.MfAddDep("std/io"c, ">=1.0.0"c);
+  mf.MfDepsJson(buf, 1024);
+  okStr("eine Dependency"c, buf as pchar, "{\"std/io\":\">=1.0.0\"}"c);
+
+  mf.MfAddDep("std/buffer"c, "^2.1.0"c);
+  mf.MfDepsJson(buf, 1024);
+  okStr("zwei, komma-getrennt"c, buf as pchar,
+        "{\"std/io\":\">=1.0.0\",\"std/buffer\":\"^2.1.0\"}"c);
+
+  // Der Aufrufer packt das Ergebnis in eine HTTP-Kopfzeile. Passt es nicht,
+  // muss das auffallen und nicht abgeschnitten werden.
+  ok("zu kleiner Puffer meldet sich"c, !mf.MfDepsJson(buf, 12));
+
+  mf.MfFree(); dispose mf;
+  free(buf, 1024);
+}
+
+// ---------------------------------------------------------------------------
+
+pub fn main(argc: int64, argv: pchar): int64 {
+  outLn("pack tests"c);
+  outLn(""c);
+
+  cleanup();     // Reste eines abgebrochenen Laufs
+
+  testArchiveName();
+  testBuild();
+  testContents();
+  testErrors();
+  testDepsJson();
+
+  cleanup();
+  ok("tests-tmp/ wieder aufgeraeumt"c, !IsDirectory(TMP));
+
+  outLn(""c);
+  out("bestanden: "c); PrintInt(tsPass);
+  out("   fehlgeschlagen: "c); PrintInt(tsFail);
+  outLn(""c);
+
+  if tsFail > 0 { return 1; }
+  return 0;
+}

@@ -1464,36 +1464,6 @@ fn lpmLogout(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
 // publish — ein .lxpkg in die Registry laden
 // ---------------------------------------------------------------------------
 
-// Baut aus den Dependencies des Manifests das JSON-Objekt fuer X-Lpm-Deps.
-// Die Registry kennt den Paketinhalt nicht; ohne diese Angabe stuende im Index
-// kein dependencies-Feld, und der Resolver saehe das Paket als abhaengigkeitsfrei.
-fn cmdDepsJson(mf: Manifest, out: int64, cap: int64): bool {
-  var p: int64 := 0;
-  poke8(out + p, 123); p := p + 1;   // {
-
-  var i: int64 := 0;
-  while i < mf.MfDepCount() {
-    var nm: pchar := mf.MfDepName(i);
-    var vr: pchar := mf.MfDepVer(i);
-    if p + StrLen(nm) + StrLen(vr) + 8 >= cap { return false; }
-
-    if i > 0 { poke8(out + p, 44); p := p + 1; }   // ,
-    poke8(out + p, 34); p := p + 1;
-    p := cmdWrS(out, p, nm);
-    poke8(out + p, 34); p := p + 1;
-    poke8(out + p, 58); p := p + 1;                // :
-    poke8(out + p, 34); p := p + 1;
-    p := cmdWrS(out, p, vr);
-    poke8(out + p, 34); p := p + 1;
-    i := i + 1;
-  }
-
-  if p + 2 >= cap { return false; }
-  poke8(out + p, 125); p := p + 1;   // }
-  poke8(out + p, 0);
-  return true;
-}
-
 fn lpmPublish(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if ctx.lcOffline {
     cmdErr("publish braucht Netzwerk, --offline ist gesetzt."c);
@@ -1565,7 +1535,7 @@ fn lpmPublish(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   }
 
   var deps: int64 := alloc(CMD_JSON_DEPS_MAX);
-  if !cmdDepsJson(mf, deps, CMD_JSON_DEPS_MAX) {
+  if !mf.MfDepsJson(deps, CMD_JSON_DEPS_MAX) {
     cmdErr("zu viele Dependencies fuer eine Kopfzeile."c);
     free(deps, CMD_JSON_DEPS_MAX);
     free(sha, 65); free(archive, CMD_PATH_MAX);
