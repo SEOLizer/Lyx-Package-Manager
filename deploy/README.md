@@ -27,7 +27,10 @@ Indizes an.
 ```bash
 scp deploy/api/lib/registry.php  root@<server>:/var/www/lpm/api/lib/
 scp deploy/api/v1/publish.php    root@<server>:/var/www/lpm/api/v1/
-ssh root@<server> 'chown -R www-data:www-data /var/www/lpm/api && chmod 644 /var/www/lpm/api/*/*.php'
+scp deploy/lpm-token             root@<server>:/usr/local/sbin/
+ssh root@<server> 'chown -R www-data:www-data /var/www/lpm/api \
+                   && chmod 644 /var/www/lpm/api/*/*.php \
+                   && chmod 755 /usr/local/sbin/lpm-token'
 ```
 
 ## 3. vhost
@@ -52,32 +55,40 @@ Die drei Regeln, auf die es ankommt:
 
 ## 4. Token anlegen
 
-Die Token-Datei liegt **außerhalb des Webroots** und enthält nur SHA256-Hashes,
-nicht die Token selbst. Wer die Datei liest, kann damit nichts hochladen.
+Dafür gibt es `lpm-token`. Es legt `/etc/lpm/tokens.json` bei Bedarf an, setzt
+die Rechte und schreibt nur SHA256-Hashes hinein — **nie den Token selbst**.
+Wer die Datei liest, kann damit nichts hochladen.
 
-```bash
-# Token erzeugen (einmalig, sicher aufbewahren — er wird nirgends wieder angezeigt)
-TOKEN=$(openssl rand -hex 32); echo "$TOKEN"
+```console
+# lpm-token add anna net/ crypto/
+Token für 'anna' (net/, crypto/):
 
-# Hash bilden
-HASH=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)
+  3f9a…  (64 Hexziffern)
 
-sudo install -d -o root -g root -m 755 /etc/lpm
-sudo tee /etc/lpm/tokens.json >/dev/null <<EOF
-{
-  "$HASH": { "publisher": "roene", "namespaces": ["net/", "std/"] }
-}
-EOF
-sudo chown root:www-data /etc/lpm/tokens.json
-sudo chmod 640 /etc/lpm/tokens.json
+Dieser Token wird NICHT gespeichert und lässt sich nicht erneut anzeigen.
 ```
 
-`namespaces` ist eine Liste erlaubter Präfixe; `"*"` erlaubt alles. Ein Token
-mit `["net/"]` kann `net/http` veröffentlichen, `crypto/tls` aber nicht — so
-lässt sich Namensraum-Übernahme verhindern, ohne für jeden Publisher einen
-eigenen Server zu brauchen.
+Die Namensräume sind erlaubte Präfixe. Ein Token mit `net/` kann `net/http`
+veröffentlichen, `crypto/tls` aber nicht — so lässt sich Namensraum-Übernahme
+verhindern, ohne für jeden Publisher einen eigenen Server zu brauchen. Ohne
+Angabe (`lpm-token add anna`) gilt `*`, also alles.
 
-Weitere Publisher: weitere Einträge in dieselbe Datei.
+```console
+# lpm-token list                 # wer hat Zugang?
+PUBLISHER            NAMENSRÄUME
+roene                *
+anna                 net/, crypto/
+
+# lpm-token remove anna          # Zugang entziehen
+```
+
+Ein entzogener Zugang lässt bereits veröffentlichte Pakete unberührt — sie
+gehören zur Registry, nicht zum Token. Ein verlorener Token lässt sich nicht
+wiederherstellen: entziehen und neu ausstellen.
+
+Von Hand ginge es auch; das Format ist
+`{"<sha256 des tokens>": {"publisher": "...", "namespaces": ["..."]}}`,
+Eigentümer `root:www-data`, Modus `640`.
 
 ## 5. Prüfen
 

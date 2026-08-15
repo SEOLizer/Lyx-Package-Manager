@@ -1,0 +1,141 @@
+#!/bin/sh
+# lpm-token — Publisher-Token der Registry verwalten.
+#
+# Läuft auf dem Registry-Server, als root. Der Token selbst wird nirgends
+# gespeichert: in /etc/lpm/tokens.json steht nur sein SHA256. Wer die Datei
+# liest, kann damit nichts hochladen — und ein verlorener Token lässt sich
+# nicht wiederherstellen, nur ersetzen.
+#
+#   lpm-token add <publisher> [<namespace> ...]   Token ausstellen
+#   lpm-token list                                Publisher anzeigen
+#   lpm-token remove <publisher>                  Zugang entziehen
+#
+# Ohne Namensraum-Angabe darf der Token überall veröffentlichen ("*").
+# Sonst gelten die angegebenen Präfixe, z. B.:
+#
+#   lpm-token add anna net/ crypto/
+#
+# erlaubt net/http und crypto/tls, aber nicht std/io.
+
+set -eu
+
+TOKENS=/etc/lpm/tokens.json
+
+die() { echo "Fehler: $*" >&2; exit 1; }
+
+[ "$(id -u)" = "0" ] || die "muss als root laufen (${TOKENS} ist nur für root schreibbar)."
+command -v php >/dev/null 2>&1 || die "php wird gebraucht."
+
+ensure_file() {
+    if [ ! -f "$TOKENS" ]; then
+        mkdir -p /etc/lpm
+        echo '{}' > "$TOKENS"
+        chown root:www-data "$TOKENS"
+        chmod 640 "$TOKENS"
+    fi
+}
+
+cmd_add() {
+    publisher="${1:-}"
+    [ -n "$publisher" ] || die "Verwendung: lpm-token add <publisher> [<namespace> ...]"
+    shift
+
+    # Namensräume einsammeln; ohne Angabe gilt "*".
+    if [ "$#" -eq 0 ]; then
+        namespaces='["*"]'
+        human='alle Namensräume'
+    else
+        namespaces=""
+        human=""
+        for ns in "$@"; do
+            namespaces="${namespaces:+$namespaces,}\"$ns\""
+            human="${human:+$human, }$ns"
+        done
+        namespaces="[$namespaces]"
+    fi
+
+    ensure_file
+
+    token=$(openssl rand -hex 32)
+    hash=$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)
+
+    php -r '
+        $file = $argv[1]; $hash = $argv[2]; $pub = $argv[3];
+        $ns = json_decode($argv[4], true);
+        $data = json_decode(file_get_contents($file), true);
+        if (!is_array($data)) { fwrite(STDERR, "tokens.json ist unlesbar\n"); exit(1); }
+        foreach ($data as $h => $info) {
+            if (($info["publisher"] ?? null) === $pub) {
+                fwrite(STDERR, "Publisher \"$pub\" hat bereits einen Token. Erst entfernen:\n");
+                fwrite(STDERR, "  lpm-token remove $pub\n");
+                exit(1);
+            }
+        }
+        $data[$hash] = ["publisher" => $pub, "namespaces" => $ns];
+        $tmp = $file . ".tmp";
+        file_put_contents($tmp, json_encode($data, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES) . "\n");
+        rename($tmp, $file);
+    ' "$TOKENS" "$hash" "$publisher" "$namespaces"
+
+    chown root:www-data "$TOKENS"
+    chmod 640 "$TOKENS"
+
+    echo "Token für '$publisher' ($human):"
+    echo
+    echo "  $token"
+    echo
+    echo "Dieser Token wird NICHT gespeichert und lässt sich nicht erneut anzeigen."
+    echo "Weitergabe an den Publisher, dort einmalig:"
+    echo
+    echo "  lpm login --token=$token"
+}
+
+cmd_list() {
+    [ -f "$TOKENS" ] || { echo "Keine Token vergeben."; return; }
+    php -r '
+        $data = json_decode(file_get_contents($argv[1]), true);
+        if (!is_array($data) || !$data) { echo "Keine Token vergeben.\n"; exit; }
+        printf("%-20s %s\n", "PUBLISHER", "NAMENSRÄUME");
+        foreach ($data as $info) {
+            printf("%-20s %s\n",
+                $info["publisher"] ?? "?",
+                implode(", ", $info["namespaces"] ?? []));
+        }
+    ' "$TOKENS"
+}
+
+cmd_remove() {
+    publisher="${1:-}"
+    [ -n "$publisher" ] || die "Verwendung: lpm-token remove <publisher>"
+    [ -f "$TOKENS" ] || die "es sind keine Token vergeben."
+
+    php -r '
+        $file = $argv[1]; $pub = $argv[2];
+        $data = json_decode(file_get_contents($file), true);
+        if (!is_array($data)) { fwrite(STDERR, "tokens.json ist unlesbar\n"); exit(1); }
+        $before = count($data);
+        $data = array_filter($data, fn($i) => ($i["publisher"] ?? null) !== $pub);
+        if (count($data) === $before) { fwrite(STDERR, "Publisher \"$pub\" ist unbekannt.\n"); exit(1); }
+        $tmp = $file . ".tmp";
+        file_put_contents($tmp, json_encode((object) $data, JSON_PRETTY_PRINT|JSON_UNESCAPED_SLASHES) . "\n");
+        rename($tmp, $file);
+    ' "$TOKENS" "$publisher"
+
+    chown root:www-data "$TOKENS"
+    chmod 640 "$TOKENS"
+    echo "Zugang für '$publisher' entzogen."
+    echo "Bereits veröffentlichte Pakete bleiben unberührt."
+}
+
+case "${1:-}" in
+    add)    shift; cmd_add "$@" ;;
+    list)   cmd_list ;;
+    remove) shift; cmd_remove "$@" ;;
+    *)
+        echo "Verwendung:"
+        echo "  lpm-token add <publisher> [<namespace> ...]   Token ausstellen"
+        echo "  lpm-token list                                Publisher anzeigen"
+        echo "  lpm-token remove <publisher>                  Zugang entziehen"
+        exit 1
+        ;;
+esac

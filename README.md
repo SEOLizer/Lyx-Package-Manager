@@ -106,6 +106,10 @@ Globale Optionen:
 | `--version`, `-V` | Version ausgeben |
 | `--help`, `-h` | Hilfe anzeigen |
 
+> **Ausführliche Anleitung:** [`docs/handbuch.md`](docs/handbuch.md) — vom
+> leeren Verzeichnis über Token und Anmeldung bis zum veröffentlichten Paket,
+> inklusive Fehlermeldungs-Tabelle.
+
 ### Ein Paket benutzen
 
 ```console
@@ -147,7 +151,9 @@ Wer nur das Archiv braucht, nimmt `lpm pack`; zweimal gepackt ergibt denselben
 SHA256. Eine veröffentlichte Version lässt sich nicht überschreiben; für eine
 Korrektur wird die Versionsnummer erhöht.
 
-Die Serverseite steht in [`deploy/README.md`](deploy/README.md).
+Den Token stellt der Registry-Betreiber mit `deploy/lpm-token add <publisher>
+[<namespace> ...]` aus — er wird genau einmal angezeigt. Serverseite:
+[`deploy/README.md`](deploy/README.md).
 
 ---
 
@@ -251,7 +257,12 @@ lyx-lpm/
     nginx-lpm.seolizer.de.conf   vhost der Registry
     api/lib/registry.php         Validierung, Index-Pflege
     api/v1/publish.php           POST /api/v1/publish
+    lpm-token                    Token ausstellen, anzeigen, entziehen
     README.md                    Server einrichten
+  docs/
+    handbuch.md                  Anleitung für Anwender
+    registry.md                  Registry-Protokoll
+    compiler-integration.md      Schnittstelle für lyxc (WP-PM-07)
   tests/
     resolver_test.lyx      Resolver-Tests (ohne Netz und Dateisystem)
     index_test.lyx         Parser-Tests
