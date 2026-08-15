@@ -34,15 +34,44 @@ fn cmdWrS(buf: int64, pos: int64, s: pchar): int64 {
   return pos + slen;
 }
 
+// `lpm resolve` liefert auf stdout ausschliesslich den Cache-Pfad — dort darf
+// keine Fortschrittsmeldung dazwischenrutschen. Statt jede Ausgabe einzeln
+// umzubiegen, schaltet dieser Schalter den Zielkanal um; alles, was ueber
+// cmdOut laeuft, geht dann nach stderr.
+var cmdOutFd: int64 := 1;
+
 fn cmdOut(s: pchar): void {
   if s == 0 as pchar { return; }
-  sys_write(1, s as int64, StrLen(s));
+  sys_write(cmdOutFd, s as int64, StrLen(s));
 }
 fn cmdOutLn(s: pchar): void {
-  if s == 0 as pchar { sys_write(1, "\n"c as int64, 1); return; }
-  sys_write(1, s as int64, StrLen(s));
-  sys_write(1, "\n"c as int64, 1);
+  if s == 0 as pchar { sys_write(cmdOutFd, "\n"c as int64, 1); return; }
+  sys_write(cmdOutFd, s as int64, StrLen(s));
+  sys_write(cmdOutFd, "\n"c as int64, 1);
 }
+// PrintInt schreibt fest auf fd 1 und wuerde die eine Pfad-Zeile von
+// `lpm resolve` verschmutzen — deshalb hier eine eigene Fassung, die
+// cmdOutFd respektiert.
+fn cmdOutInt(n: int64): void {
+  if n == 0 { sys_write(cmdOutFd, "0"c as int64, 1); return; }
+
+  var v: int64 := n;
+  if v < 0 {
+    sys_write(cmdOutFd, "-"c as int64, 1);
+    v := 0 - v;
+  }
+
+  var buf: int64 := alloc(24);
+  var i: int64 := 24;
+  while v > 0 {
+    i := i - 1;
+    poke8(buf + i, (48 + v % 10) as int8);
+    v := v / 10;
+  }
+  sys_write(cmdOutFd, buf + i, 24 - i);
+  free(buf, 24);
+}
+
 fn cmdErr(s: pchar): void {
   sys_write(2, "lpm: error: "c as int64, 12);
   sys_write(2, s as int64, StrLen(s));
@@ -318,8 +347,8 @@ fn cmdBuildCatalog(home: pchar, cat: DepCatalog, verbose: bool): void {
   LpmCacheFreePath(regDir);
 
   if verbose {
-    cmdOut("lpm: Katalog: "c); PrintInt(fromCache);
-    cmdOut(" aus dem Cache, "c); PrintInt(fromIndex);
+    cmdOut("lpm: Katalog: "c); cmdOutInt(fromCache);
+    cmdOut(" aus dem Cache, "c); cmdOutInt(fromIndex);
     cmdOutLn(" aus gespiegelten Indizes."c);
   }
 }
@@ -375,7 +404,7 @@ fn cmdFetchPkg(ctx: LpmCtx, home: pchar, name: pchar, version: pchar,
 
   if ctx.lcVerbose {
     cmdOut("lpm: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
-    cmdOut(" entpackt ("c); PrintInt(urc); cmdOutLn(" Datei(en))."c);
+    cmdOut(" entpackt ("c); cmdOutInt(urc); cmdOutLn(" Datei(en))."c);
   }
   LpmCacheFreePath(dest);
   return true;
@@ -531,11 +560,11 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
     n := n + 1;
   }
 
-  cmdOut("lpm: "c); PrintInt(r.RsCount());
+  cmdOut("lpm: "c); cmdOutInt(r.RsCount());
   cmdOutLn(" Paket(e) aufgeloest, lyx.lock geschrieben."c);
 
   if missing > 0 {
-    cmdOut("lpm: "c); PrintInt(missing);
+    cmdOut("lpm: "c); cmdOutInt(missing);
     cmdOutLn(" Paket(e) fehlen lokal und liessen sich nicht holen."c);
     cmdOutLn("     Hilft auch: lpm cache add <archiv.lxpkg> <name> <version>"c);
   }
@@ -927,7 +956,7 @@ fn lpmSearch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if hits == 0 {
     cmdOut("lpm: nichts gefunden fuer '"c); cmdOut(query); cmdOutLn("'."c);
   } else {
-    cmdOut("lpm: "c); PrintInt(hits); cmdOutLn(" Treffer."c);
+    cmdOut("lpm: "c); cmdOutInt(hits); cmdOutLn(" Treffer."c);
   }
 
   list.PlFree(); dispose list;
@@ -999,8 +1028,187 @@ fn lpmInfo(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
     i := i + 1;
   }
 
-  cmdOut("  "c); PrintInt(shown); cmdOutLn(" Version(en)."c);
+  cmdOut("  "c); cmdOutInt(shown); cmdOutLn(" Version(en)."c);
   cat.DcFree(); dispose cat;
+  return 0;
+}
+
+// ---------------------------------------------------------------------------
+// resolve — Auflösungs-Hook für lyxc (WP-PM-07)
+// ---------------------------------------------------------------------------
+//
+// Aufrufvertrag, auf den sich lyxc verlassen darf:
+//
+//   stdout  bei Erfolg GENAU eine Zeile: der Cache-Pfad des Pakets.
+//           Sonst nichts — kein Fortschritt, keine Warnung, keine Leerzeile.
+//   stderr  alle Meldungen, auch die von --verbose.
+//   Exit 0  Paket liegt im Cache, der Pfad auf stdout ist gültig.
+//   Exit 1  nicht auflösbar (unbekannt, Netz weg, Hash falsch, ...).
+//
+// Diese Trennung ist der ganze Sinn des Befehls: der Compiler liest stdout
+// direkt als Pfad. Jede versehentliche Zeile mehr würde ihn in die Irre führen,
+// deshalb schreiben die Hilfsfunktionen hier ausschliesslich nach stderr.
+
+// Wie cmdOut/cmdOutLn, aber nach stderr.
+fn cmdEOut(s: pchar): void {
+  if s == 0 as pchar { return; }
+  sys_write(2, s as int64, StrLen(s));
+}
+fn cmdEOutLn(s: pchar): void {
+  cmdEOut(s);
+  sys_write(2, "\n"c as int64, 1);
+}
+
+// Übersetzt einen Import-Namen in einen Paketnamen.
+//
+// lyxc sieht `import net.http` und kennt damit Punkte als Trenner; die Registry
+// führt `net/http`. Enthält der Name bereits einen Slash, wird er unverändert
+// übernommen — dann kommt er aus einem Manifest und ist schon richtig. Sonst
+// werden Punkte zu Slashes.
+//
+// Der Grenzfall ist ein flacher Name mit Punkt (`core.io`): der wird hier zu
+// `core/io`. Beides gleichzeitig geht nicht, und die hierarchische Lesart ist
+// die, die zur Import-Syntax des Compilers passt.
+fn cmdImportToPkg(name: pchar, dst: int64, cap: int64): bool {
+  var n: int64 := StrLen(name);
+  if n == 0 { return false; }
+  if n >= cap { return false; }
+
+  var hasSlash: bool := false;
+  var i: int64 := 0;
+  while i < n {
+    if peek8(name as int64 + i) as int64 == 47 { hasSlash := true; }
+    i := i + 1;
+  }
+
+  i := 0;
+  while i < n {
+    var c: int64 := peek8(name as int64 + i) as int64;
+    if !hasSlash {
+      if c == 46 { c := 47; }
+    }
+    poke8(dst + i, c as int8);
+    i := i + 1;
+  }
+  poke8(dst + n, 0);
+  return true;
+}
+
+// Gibt es zu name bereits einen Lock-Eintrag? Dann gilt dessen Version — der
+// Compiler soll dasselbe sehen wie ein `lpm install`, nicht die neueste Version.
+// Rueckgabe: true, wenn *verOut gefuellt wurde.
+fn cmdLockedVersion(name: pchar, verOut: int64, cap: int64): bool {
+  if !FileExists("lyx.lock"c) { return false; }
+
+  var lock: LockFile := new LockFile();
+  lock.LfInit();
+  var found: bool := false;
+  if lock.LfRead("lyx.lock"c) {
+    var idx: int64 := lock.LfFind(name);
+    if idx >= 0 {
+      var v: pchar := lock.LfGetVer(idx);
+      if v != 0 as pchar {
+        var vl: int64 := StrLen(v);
+        if vl < cap {
+          memcpy(verOut, v as int64, vl);
+          poke8(verOut + vl, 0);
+          found := true;
+        }
+      }
+    }
+  }
+  lock.LfFree(); dispose lock;
+  return found;
+}
+
+// Schreibt den Cache-Pfad von name@version auf stdout, mit Zeilenumbruch.
+fn cmdPrintCachePath(home: pchar, name: pchar, version: pchar): void {
+  var p: pchar := LpmCachePkgPath(home, name, version);
+  sys_write(1, p as int64, StrLen(p));
+  sys_write(1, "\n"c as int64, 1);
+  LpmCacheFreePath(p);
+}
+
+fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var arg: pchar := ctx.LcSubArg(0);
+  if arg == 0 as pchar {
+    cmdEOutLn("lpm: error: resolve braucht einen Paket- oder Importnamen."c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+  if home == 0 as pchar {
+    cmdEOutLn("lpm: error: HOME ist nicht gesetzt."c);
+    return 1;
+  }
+
+  var name: int64 := alloc(CMD_NAME_MAX);
+  if !cmdImportToPkg(arg, name, CMD_NAME_MAX) {
+    cmdEOutLn("lpm: error: Paketname unbrauchbar."c);
+    free(name, CMD_NAME_MAX);
+    return 1;
+  }
+  var pkg: pchar := name as pchar;
+
+  // 1. Steht die Version im Lock und liegt sie im Cache? Dann sofort fertig —
+  //    das ist der haeufigste Fall waehrend einer Kompilierung und darf weder
+  //    das Netz noch die Uhr anfassen.
+  var ver: int64 := alloc(CMD_NAME_MAX);
+  var locked: bool := cmdLockedVersion(pkg, ver, CMD_NAME_MAX);
+  if locked {
+    if LpmCacheHas(home, pkg, ver as pchar) {
+      cmdPrintCachePath(home, pkg, ver as pchar);
+      free(ver, CMD_NAME_MAX);
+      free(name, CMD_NAME_MAX);
+      return 0;
+    }
+  }
+
+  // 2. Sonst aufloesen wie bei `install` — inklusive Download, Hash-Pruefung
+  //    und Lock-Aktualisierung. Der Compiler bekommt damit ein Paket, das auch
+  //    ein spaeteres `lpm install` genau so herstellen wuerde.
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  cmdLoadManifest(mf);
+
+  var cons: pchar := "*"c;
+  if locked { cons := ver as pchar; }
+  mf.MfSetDep(pkg, cons);
+
+  cmdOutFd := 2;
+  var rc: int64 := cmdResolveAndLock(ctx, home, mf);
+  cmdOutFd := 1;
+  mf.MfFree(); dispose mf;
+  free(ver, CMD_NAME_MAX);
+
+  if rc != CMD_RES_OK {
+    cmdEOut("lpm: error: "c); cmdEOut(pkg);
+    cmdEOutLn(" liess sich nicht aufloesen."c);
+    free(name, CMD_NAME_MAX);
+    return 1;
+  }
+
+  // 3. Version aus dem frisch geschriebenen Lock nehmen.
+  var ver2: int64 := alloc(CMD_NAME_MAX);
+  var ok: bool := cmdLockedVersion(pkg, ver2, CMD_NAME_MAX);
+  if !ok {
+    cmdEOut("lpm: error: "c); cmdEOut(pkg);
+    cmdEOutLn(" steht nach der Aufloesung nicht in lyx.lock."c);
+    free(ver2, CMD_NAME_MAX);
+    free(name, CMD_NAME_MAX);
+    return 1;
+  }
+  if !LpmCacheHas(home, pkg, ver2 as pchar) {
+    cmdEOut("lpm: error: "c); cmdEOut(pkg);
+    cmdEOutLn(" ist aufgeloest, liegt aber nicht im Cache."c);
+    free(ver2, CMD_NAME_MAX);
+    free(name, CMD_NAME_MAX);
+    return 1;
+  }
+
+  cmdPrintCachePath(home, pkg, ver2 as pchar);
+  free(ver2, CMD_NAME_MAX);
+  free(name, CMD_NAME_MAX);
   return 0;
 }
 
@@ -1035,7 +1243,7 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if StrCmp(cmd, "list"c)    == 0 { return lpmList(argc, argv); }
   if StrCmp(cmd, "publish"c) == 0 { return lpmNotImpl("publish"c); }
   if StrCmp(cmd, "login"c)   == 0 { return lpmNotImpl("login"c); }
-  if StrCmp(cmd, "resolve"c) == 0 { return lpmNotImpl("resolve"c); }
+  if StrCmp(cmd, "resolve"c) == 0 { return lpmResolve(ctx, argc, argv); }
 
   if StrCmp(cmd, "cache"c) == 0 {
     // Achtung: && schliesst hier nicht kurz — Null-Check muss geschachtelt sein.
