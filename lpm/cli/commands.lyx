@@ -136,6 +136,7 @@ fn lpmHelp(): void {
   cmdOutLn("  cache list             Gecachte Pakete anzeigen"c);
   cmdOutLn("  cache clean            Cache leeren"c);
   cmdOutLn("  cache add <f> <n> <v>  Lokales .lxpkg in den Cache entpacken"c);
+  cmdOutLn("  cache remove <n> [<v>] Paket aus dem Cache entfernen"c);
   cmdOutLn(""c);
   cmdOutLn("Globale Optionen:"c);
   cmdOutLn("  --verbose / -v         Ausführliche Ausgabe"c);
@@ -214,6 +215,52 @@ fn lpmCacheList(argc: int64, argv: pchar): int64 {
 fn lpmCacheClean(argc: int64, argv: pchar): int64 {
   var home: pchar := cmdGetHome(argc, argv);
   return LpmCacheCleanCmd(home);
+}
+
+// ---------------------------------------------------------------------------
+// lpm cache remove <name> [<version>]
+//
+// Ohne Version werden alle Versionen des Pakets entfernt. Gebraucht wird das,
+// wenn ein einzelnes Paket im Cache stoert — `cache clean` waere dafuer der
+// Vorschlaghammer, weil es auch alles wegraeumt, was gerade heruntergeladen
+// wurde.
+// ---------------------------------------------------------------------------
+
+fn lpmCacheRemove(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
+  var name: pchar := ctx.LcSubArg(1);
+  var version: pchar := ctx.LcSubArg(2);
+
+  if name == 0 as pchar {
+    cmdErr("Verwendung: lpm cache remove <name> [<version>]"c);
+    return 1;
+  }
+
+  var home: pchar := cmdGetHome(argc, argv);
+
+  if version != 0 as pchar {
+    if !LpmCacheHas(home, name, version) {
+      cmdOut("lpm: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+      cmdOutLn(" liegt nicht im Cache."c);
+      return 1;
+    }
+    if !LpmCacheDropPkg(home, name, version) {
+      cmdErr("Verzeichnis liess sich nicht entfernen."c);
+      return 1;
+    }
+    cmdOut("lpm: "c); cmdOut(name); cmdOut("@"c); cmdOut(version);
+    cmdOutLn(" aus dem Cache entfernt."c);
+    return 0;
+  }
+
+  var n: int64 := LpmCacheDropAll(home, name);
+  if n < 0 {
+    cmdOut("lpm: "c); cmdOut(name); cmdOutLn(" liegt nicht im Cache."c);
+    return 1;
+  }
+
+  cmdOut("lpm: "c); cmdOut(name); cmdOut(" entfernt ("c);
+  cmdOutInt(n); cmdOutLn(" Version(en))."c);
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,6 +1587,28 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
 // pack — aus dem aktuellen Verzeichnis ein .lxpkg bauen
 // ---------------------------------------------------------------------------
 
+// Warnt vor Imports, die im Manifest fehlen.
+//
+// Bewusst eine Warnung: lpm kann nicht wissen, ob eine Unit aus der Registry
+// kommen soll. Wer eine Datei nachbarschaftlich mitliefert oder eine Unit aus
+// dem eigenen Projektbaum zieht, hat recht — der Fall, der hier auffallen soll,
+// ist der vergessene Eintrag in [dependencies].
+fn cmdWarnImports(dir: pchar, mf: Manifest): void {
+  var n: int64 := PkFindUndeclaredImports(dir, mf);
+  if n > 0 {
+    cmdOut("lpm: warning: "c); cmdOutInt(n);
+    cmdOutLn(" Import(e) stehen nicht in [dependencies]:"c);
+    var i: int64 := 0;
+    while i < n {
+      cmdOut("     "c); cmdOutLn(PkUndeclaredName(i));
+      i := i + 1;
+    }
+    cmdOutLn("     Wer sie aus der Registry bezieht, traegt sie ein:"c);
+    cmdOutLn("     lpm install <paket>"c);
+  }
+  PkUndeclaredFree();
+}
+
 fn lpmPack(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   var dir: pchar := ctx.LcSubArg(0);
   if dir == 0 as pchar { dir := "."c; }
@@ -1596,6 +1665,8 @@ fn lpmPack(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   op := cmdWrS(out, op, fname as pchar);
   poke8(out + op, 0);
   free(fname, CMD_PATH_MAX);
+
+  cmdWarnImports(dir, mf);
 
   var sha: int64 := alloc(65);
   var rc: int64 := PkBuild(dir, out as pchar, sha);
@@ -1735,6 +1806,8 @@ fn lpmPublish(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   poke8(archive + ap, 0);
   free(fname, CMD_PATH_MAX);
 
+  cmdWarnImports(dir, mf);
+
   var sha: int64 := alloc(65);
   var prc: int64 := PkBuild(dir, archive as pchar, sha);
   if prc != PK_OK {
@@ -1843,8 +1916,9 @@ pub fn lpmDispatch(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
       if StrCmp(sub, "list"c)  == 0 { return lpmCacheList(argc, argv); }
       if StrCmp(sub, "clean"c) == 0 { return lpmCacheClean(argc, argv); }
       if StrCmp(sub, "add"c)   == 0 { return lpmCacheAdd(ctx, argc, argv); }
+      if StrCmp(sub, "remove"c) == 0 { return lpmCacheRemove(ctx, argc, argv); }
     }
-    cmdOutLn("lpm cache: Subcommand erwartet: list | clean | add"c);
+    cmdOutLn("lpm cache: Subcommand erwartet: list | clean | add | remove"c);
     return 1;
   }
 

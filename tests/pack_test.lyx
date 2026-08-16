@@ -100,6 +100,13 @@ fn cleanup(): void {
   Rmdir("tests-tmp/src/docs"c);
   Rmdir("tests-tmp/src"c);
 
+  DeleteFile("tests-tmp/imp/lyx.toml"c);
+  DeleteFile("tests-tmp/imp/main.lyx"c);
+  DeleteFile("tests-tmp/imp/helfer.lyx"c);
+  DeleteFile("tests-tmp/imp/sauber.lyx"c);
+  DeleteFile("tests-tmp/imp/docs.md"c);
+  Rmdir("tests-tmp/imp"c);
+
   DeleteFile("tests-tmp/out.lxpkg"c);
   DeleteFile("tests-tmp/out2.lxpkg"c);
   DeleteFile("tests-tmp/empty/lyx.toml"c);
@@ -343,6 +350,87 @@ fn testVerifyErrStr(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Undeklarierte Imports
+// ---------------------------------------------------------------------------
+//
+// Geprueft wird an einem eigenen Verzeichnis, damit die Quelldateien genau die
+// Faelle enthalten, um die es geht.
+
+fn buildImportSource(): void {
+  Mkdir(TMP, 493);
+  Mkdir("tests-tmp/imp"c, 493);
+
+  writeFile("tests-tmp/imp/lyx.toml"c,
+            "[package]\nname = \"demo/luecke\"\nversion = \"0.1.0\"\n\n[dependencies]\n\"demo/mid\" = \"^1.0.0\"\n\n[build]\nentry = \"main.lyx\"\n"c);
+
+  // std.* gehoert zum Compiler, demo/mid steht im Manifest, demo.luecke.intern
+  // liegt unter dem eigenen Namen, helfer.lyx liegt daneben — nur demo/base und
+  // crypto/tls fehlen wirklich.
+  writeFile("tests-tmp/imp/main.lyx"c,
+            "unit demo.luecke;\n\nimport std.io;\nimport std.net.https;\nimport demo.mid;\nimport demo.base;\nimport demo.luecke.intern;\nimport demo.helfer;\n\npub fn X(): int64 { return 1; }\n"c);
+  writeFile("tests-tmp/imp/helfer.lyx"c,
+            "unit demo.helfer;\n\nimport crypto.tls grant [fs.read];\nimport demo.base;\n"c);
+  // Nicht-Lyx-Dateien werden nicht durchsucht.
+  writeFile("tests-tmp/imp/docs.md"c, "import fake.paket;\n"c);
+}
+
+fn cleanupImports(): void {
+  DeleteFile("tests-tmp/imp/lyx.toml"c);
+  DeleteFile("tests-tmp/imp/main.lyx"c);
+  DeleteFile("tests-tmp/imp/helfer.lyx"c);
+  DeleteFile("tests-tmp/imp/docs.md"c);
+  Rmdir("tests-tmp/imp"c);
+}
+
+fn testUndeclaredImports(): void {
+  outLn("undeklarierte Imports"c);
+  buildImportSource();
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  mf.MfRead("tests-tmp/imp/lyx.toml"c);
+
+  var n: int64 := PkFindUndeclaredImports("tests-tmp/imp"c, mf);
+  okInt("genau zwei fehlen"c, n, 2);
+
+  // Die Dateien werden sortiert durchgegangen — helfer.lyx vor main.lyx.
+  // Darin steht crypto/tls zuerst, demo/base folgt (und wird aus main.lyx
+  // nicht ein zweites Mal gemeldet).
+  okStr("crypto/tls fehlt"c, PkUndeclaredName(0), "crypto/tls"c);
+  okStr("demo/base fehlt"c, PkUndeclaredName(1), "demo/base"c);
+
+  ok("std.* wird nicht gemeldet"c, n == 2);
+  ok("Index ausserhalb liefert leer"c, StrLen(PkUndeclaredName(5)) == 0);
+
+  PkUndeclaredFree();
+  okInt("nach dem Freigeben leer"c, PkUndeclaredCount(), 0);
+
+  mf.MfFree(); dispose mf;
+  cleanupImports();
+}
+
+fn testNoUndeclared(): void {
+  outLn("alle Imports deklariert"c);
+  Mkdir(TMP, 493);
+  Mkdir("tests-tmp/imp"c, 493);
+  writeFile("tests-tmp/imp/lyx.toml"c,
+            "[package]\nname = \"demo/sauber\"\nversion = \"1.0.0\"\n\n[dependencies]\n\"demo/base\" = \"^1.0.0\"\n"c);
+  writeFile("tests-tmp/imp/sauber.lyx"c,
+            "unit demo.sauber;\n\nimport std.io;\nimport demo.base;\n"c);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  mf.MfRead("tests-tmp/imp/lyx.toml"c);
+  okInt("nichts zu melden"c, PkFindUndeclaredImports("tests-tmp/imp"c, mf), 0);
+  PkUndeclaredFree();
+  mf.MfFree(); dispose mf;
+
+  DeleteFile("tests-tmp/imp/lyx.toml"c);
+  DeleteFile("tests-tmp/imp/sauber.lyx"c);
+  Rmdir("tests-tmp/imp"c);
+}
+
+// ---------------------------------------------------------------------------
 // Dependencies als JSON — so gehen sie beim Veroeffentlichen an die Registry
 // ---------------------------------------------------------------------------
 
@@ -390,6 +478,8 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testVerifyTraversal();
   testVerifyErrStr();
   testErrors();
+  testUndeclaredImports();
+  testNoUndeclared();
   testDepsJson();
 
   cleanup();

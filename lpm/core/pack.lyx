@@ -437,3 +437,324 @@ pub fn PkErrStr(code: int64): pchar {
   if code == PK_ERR_WRITE    { return "Archiv liess sich nicht schreiben"c; }
   return "unbekannter Fehler"c;
 }
+
+// ---------------------------------------------------------------------------
+// Undeklarierte Imports finden
+// ---------------------------------------------------------------------------
+//
+// lpm liest keinen Lyx-Quelltext — Abhaengigkeiten kommen ausschliesslich aus
+// lyx.toml (siehe README). Das hat eine unangenehme Seite: ein Paket, dessen
+// Code `import demo.base` enthaelt, das aber nichts deklariert, laesst sich
+// anstandslos bauen und veroeffentlichen. Der Fehler faellt erst beim Anwender
+// auf, und dessen Compiler zeigt dann auf sein Projekt statt auf das
+// lueckenhafte Paket.
+//
+// Diese Pruefung ist bewusst kein Parser. Sie sucht Zeilen, die mit `import`
+// beginnen, nimmt den folgenden Namen und vergleicht ihn mit dem, was im
+// Manifest steht. Was sie findet, ist eine WARNUNG und kein Fehler: Units, die
+// mit dem Compiler kommen (std.*, data.*, src.*), gehoeren nicht in die
+// Registry, und ein Paket darf seine eigenen Units importieren.
+
+con PK_IMP_MAX:  int64 := 64;    // gemeldete Namen je Lauf
+con PK_NAME_MAX: int64 := 256;
+
+var pkImports: int64 := 0;   // int64[PK_IMP_MAX], Zeiger auf Namen
+var pkImpCount: int64 := 0;
+
+pub fn PkUndeclaredCount(): int64 { return pkImpCount; }
+
+pub fn PkUndeclaredName(i: int64): pchar {
+  if i < 0 { return ""c; }
+  if i >= pkImpCount { return ""c; }
+  return peek64(pkImports + i * 8) as pchar;
+}
+
+pub fn PkUndeclaredFree(): void {
+  if pkImports == 0 { return; }
+  var i: int64 := 0;
+  while i < pkImpCount {
+    free(peek64(pkImports + i * 8), PK_NAME_MAX);
+    i := i + 1;
+  }
+  free(pkImports, PK_IMP_MAX * 8);
+  pkImports := 0;
+  pkImpCount := 0;
+}
+
+// Kommt der Name schon in der Liste vor? Ein Import, der in fuenf Dateien
+// steht, soll nicht fuenfmal gemeldet werden.
+fn pkAlreadyListed(name: pchar): bool {
+  var i: int64 := 0;
+  while i < pkImpCount {
+    if StrCmp(peek64(pkImports + i * 8) as pchar, name) == 0 { return true; }
+    i := i + 1;
+  }
+  return false;
+}
+
+fn pkAddUndeclared(name: pchar): void {
+  if pkImpCount >= PK_IMP_MAX { return; }
+  if pkAlreadyListed(name) { return; }
+  var n: int64 := StrLen(name);
+  if n >= PK_NAME_MAX { return; }
+  var copy: int64 := alloc(PK_NAME_MAX);
+  memcpy(copy, name as int64, n);
+  poke8(copy + n, 0);
+  poke64(pkImports + pkImpCount * 8, copy);
+  pkImpCount := pkImpCount + 1;
+}
+
+// Units, die mit dem Compiler kommen und nicht aus der Registry stammen.
+fn pkIsBuiltinUnit(name: pchar): bool {
+  var n: int64 := StrLen(name);
+  if n >= 4 {
+    if peek8(name as int64) as int64 == 115 {          // s
+      if peek8(name as int64 + 1) as int64 == 116 {    // t
+        if peek8(name as int64 + 2) as int64 == 100 {  // d
+          if peek8(name as int64 + 3) as int64 == 47 { return true; }   // std/
+        }
+      }
+    }
+  }
+  if n >= 5 {
+    var d: pchar := "data/"c;
+    var i: int64 := 0;
+    var same: bool := true;
+    while i < 5 {
+      if peek8(name as int64 + i) as int64 != peek8(d as int64 + i) as int64 { same := false; break; }
+      i := i + 1;
+    }
+    if same { return true; }
+  }
+  if n >= 4 {
+    var sp: pchar := "src/"c;
+    var j: int64 := 0;
+    var same2: bool := true;
+    while j < 4 {
+      if peek8(name as int64 + j) as int64 != peek8(sp as int64 + j) as int64 { same2 := false; break; }
+      j := j + 1;
+    }
+    if same2 { return true; }
+  }
+  return false;
+}
+
+// Liest den Importnamen ab Position i (dort steht das Wort "import").
+// Schreibt ihn als Paketnamen (Punkte zu Slashes) nach dst.
+// Rueckgabe: true, wenn ein Name gefunden wurde.
+fn pkImportName(buf: int64, i: int64, len: int64, dst: int64): bool {
+  var p: int64 := i + 6;                 // hinter "import"
+  while p < len {
+    var c: int64 := peek8(buf + p) as int64;
+    if c != 32 { if c != 9 { break; } }
+    p := p + 1;
+  }
+
+  var n: int64 := 0;
+  while p < len {
+    var c: int64 := peek8(buf + p) as int64;
+    // Der Name endet am Semikolon, an Leerraum (z.B. vor `grant`) oder am
+    // Zeilenende.
+    if c == 59 { break; }
+    if c == 32 { break; }
+    if c == 9  { break; }
+    if c == 10 { break; }
+    if c == 13 { break; }
+
+    if n >= PK_NAME_MAX - 1 { return false; }
+    if c == 46 { c := 47; }              // '.' -> '/'
+    poke8(dst + n, c as int8);
+    n := n + 1;
+    p := p + 1;
+  }
+
+  poke8(dst + n, 0);
+  return n > 0;
+}
+
+// Gehoert der Import zum eigenen Paket?
+//
+// Zwei Faelle: der Name ist das Paket selbst oder liegt darunter
+// (demo/luecke/intern in demo/luecke), oder die Unit liegt als Datei im
+// Paketverzeichnis — genau der Fall "mehrere Units in einem Paket" aus dem
+// Handbuch. Ohne diese beiden Ausnahmen wuerde die Warnung dauerhaft anschlagen,
+// wo nichts fehlt.
+fn pkIsOwnUnit(name: pchar, ownName: pchar, dir: pchar): bool {
+  if ownName != 0 as pchar {
+    if StrCmp(name, ownName) == 0 { return true; }
+    var on: int64 := StrLen(ownName);
+    var nn: int64 := StrLen(name);
+    if nn > on {
+      if peek8(name as int64 + on) as int64 == 47 {
+        var i: int64 := 0;
+        var same: bool := true;
+        while i < on {
+          if peek8(name as int64 + i) as int64 != peek8(ownName as int64 + i) as int64 {
+            same := false;
+            break;
+          }
+          i := i + 1;
+        }
+        if same { return true; }
+      }
+    }
+  }
+
+  // <letztes Segment>.lyx im Paketverzeichnis?
+  var n: int64 := StrLen(name);
+  var last: int64 := 0;
+  var k: int64 := 0;
+  while k < n {
+    if peek8(name as int64 + k) as int64 == 47 { last := k + 1; }
+    k := k + 1;
+  }
+
+  var probe: int64 := alloc(PK_PATH_MAX);
+  var p: int64 := 0;
+  p := pkAppend(probe, p, dir);
+  p := pkAppend(probe, p, "/"c);
+  p := pkAppend(probe, p, (name as int64 + last) as pchar);
+  var base: int64 := p;
+  p := pkAppend(probe, p, ".lyx"c);
+  pkEnd(probe, p);
+
+  var found: bool := FileExists(probe as pchar);
+  if !found {
+    p := base;
+    p := pkAppend(probe, p, ".lyu"c);
+    pkEnd(probe, p);
+    found := FileExists(probe as pchar);
+  }
+  free(probe, PK_PATH_MAX);
+  return found;
+}
+
+// Durchsucht eine Datei nach import-Zeilen.
+fn pkScanFile(path: pchar, mf: Manifest, ownName: pchar, dir: pchar): void {
+  var size: int64 := FileSize(path);
+  if size <= 0 { return; }
+  if size > PK_FILE_MAX { return; }
+
+  var buf: int64 := alloc(size + 1);
+  var got: int64 := ReadFile(path, buf as pchar, size);
+  if got <= 0 { free(buf, size + 1); return; }
+  poke8(buf + got, 0);
+
+  var name: int64 := alloc(PK_NAME_MAX);
+  var i: int64 := 0;
+
+  while i < got {
+    // Zeilenanfang bestimmen
+    var lineStart: int64 := i;
+    var lineEnd: int64 := i;
+    while lineEnd < got {
+      if peek8(buf + lineEnd) as int64 == 10 { break; }
+      lineEnd := lineEnd + 1;
+    }
+
+    // fuehrenden Leerraum ueberspringen
+    var p: int64 := lineStart;
+    while p < lineEnd {
+      var c: int64 := peek8(buf + p) as int64;
+      if c != 32 { if c != 9 { break; } }
+      p := p + 1;
+    }
+
+    // "import" gefolgt von Leerraum?
+    if lineEnd - p > 7 {
+      var kw: pchar := "import"c;
+      var k: int64 := 0;
+      var isImport: bool := true;
+      while k < 6 {
+        if peek8(buf + p + k) as int64 != peek8(kw as int64 + k) as int64 {
+          isImport := false;
+          break;
+        }
+        k := k + 1;
+      }
+      if isImport {
+        var after: int64 := peek8(buf + p + 6) as int64;
+        if after == 32 || after == 9 {
+          if pkImportName(buf, p, lineEnd, name) {
+            var nm: pchar := name as pchar;
+            var known: bool := pkIsBuiltinUnit(nm);
+            if !known {
+              if pkIsOwnUnit(nm, ownName, dir) { known := true; }
+            }
+            if !known {
+              if mf.MfFindDep(nm) >= 0 { known := true; }
+            }
+            if !known { pkAddUndeclared(nm); }
+          }
+        }
+      }
+    }
+
+    i := lineEnd + 1;
+  }
+
+  free(name, PK_NAME_MAX);
+  free(buf, size + 1);
+}
+
+// Sucht in allen .lyx-Dateien unter dir nach Imports, die weder im Manifest
+// stehen noch zum Compiler gehoeren.
+//
+// Rueckgabe: Anzahl der gefundenen Namen, abrufbar ueber PkUndeclaredName.
+// Der Aufrufer gibt sie mit PkUndeclaredFree wieder frei.
+pub fn PkFindUndeclaredImports(dir: pchar, mf: Manifest): int64 {
+  PkUndeclaredFree();
+  pkImports := alloc(PK_IMP_MAX * 8);
+  pkImpCount := 0;
+
+  // Dieselbe Dateiliste wie beim Packen — geprueft wird also genau das, was
+  // auch im Archiv landet.
+  pkListInit();
+  var root: int64 := alloc(PK_PATH_MAX);
+  var rp: int64 := pkAppend(root, 0, dir);
+  pkEnd(root, rp);
+
+  var empty: int64 := alloc(PK_PATH_MAX);
+  poke8(empty, 0);
+  pkWalk(root, empty, 0);
+  free(empty, PK_PATH_MAX);
+
+  var ownName: pchar := mf.MfName();
+
+  var i: int64 := 0;
+  while i < pkCount {
+    var rel: pchar := peek64(pkNames + i * 8) as pchar;
+    var rlen: int64 := StrLen(rel);
+
+    // nur .lyx-Dateien
+    var isLyx: bool := false;
+    if rlen > 4 {
+      var suf: pchar := ".lyx"c;
+      var k: int64 := 0;
+      isLyx := true;
+      while k < 4 {
+        if peek8(rel as int64 + rlen - 4 + k) as int64 != peek8(suf as int64 + k) as int64 {
+          isLyx := false;
+          break;
+        }
+        k := k + 1;
+      }
+    }
+
+    if isLyx {
+      var full: int64 := alloc(PK_PATH_MAX);
+      var fp: int64 := 0;
+      fp := pkAppend(full, fp, root as pchar);
+      fp := pkAppend(full, fp, "/"c);
+      fp := pkAppend(full, fp, rel);
+      pkEnd(full, fp);
+      pkScanFile(full as pchar, mf, ownName, root as pchar);
+      free(full, PK_PATH_MAX);
+    }
+    i := i + 1;
+  }
+
+  free(root, PK_PATH_MAX);
+  pkListFree();
+  return pkImpCount;
+}

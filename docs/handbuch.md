@@ -15,6 +15,7 @@ Die Serverseite (Registry einrichten, vhost, Token-Datei) steht in
 3. [Ein eigenes Paket bauen](#3-ein-eigenes-paket-bauen)
    — auch: [mehrere Units aufteilen](#mehrere-units--ein-paket-oder-mehrere)
 4. [Einen Token bekommen](#4-einen-token-bekommen)
+   — auch: [eigene Registry statt Token](#eine-eigene-registry-statt-eines-tokens)
 5. [Anmelden](#5-anmelden)
 6. [Veröffentlichen](#6-veröffentlichen)
 7. [Alltag](#7-alltag)
@@ -167,6 +168,29 @@ Alles andere kommt mit, bis Verzeichnistiefe 4.
 
 Zusätzlich landet ein **`FILES.sha256`** im Archiv, mit einer Zeile je Datei.
 
+### Warnung bei undeklarierten Imports
+
+`pack` und `publish` durchsuchen die `.lyx`-Dateien nach `import`-Zeilen und
+melden, was weder in `[dependencies]` steht noch zum Compiler gehört:
+
+```console
+$ lpm pack
+lpm: warning: 2 Import(e) stehen nicht in [dependencies]:
+     crypto/tls
+     demo/base
+     Wer sie aus der Registry bezieht, traegt sie ein:
+     lpm install <paket>
+lpm: demo/luecke@0.1.0 gepackt:
+```
+
+Das ist eine **Warnung, kein Fehler** — das Paket wird gebaut. `lpm` kann nicht
+wissen, woher eine Unit kommen soll; gemeint ist der vergessene Eintrag.
+
+Nicht gemeldet werden Units, die mit dem Compiler kommen (`std.*`, `data.*`,
+`src.*`), das eigene Paket samt allem darunter (`demo.luecke.intern` in
+`demo/luecke`), und Units, die als Datei im selben Paket liegen — der Fall
+„mehrere Units in einem Paket" von oben.
+
 Wer nur lokal testen will, braucht die Registry nicht:
 
 ```console
@@ -249,12 +273,61 @@ Bis dahin ist die Schleife oben der Weg.
 Zum Lesen der Registry braucht es nichts. Wer **veröffentlichen** will, braucht
 einen Token vom Betreiber der Registry.
 
+### Es gibt keine Selbstregistrierung
+
+`lpm.seolizer.de` liefert nur Paketdaten aus. Die Wurzel ist geschlossen:
+
+```console
+$ curl -o /dev/null -w '%{http_code}\n' https://lpm.seolizer.de/
+403
+
+$ curl -o /dev/null -w '%{http_code}\n' https://lpm.seolizer.de/index.json
+200
+```
+
+Kein Anmeldeformular, keine Weboberfläche, kein Benutzerkonto. Token werden von
+Hand vergeben — Absicht, denn der Namensraum eines Paketmanagers lässt sich
+kaum zurückholen, wenn er einmal belegt ist.
+
 ### Als Publisher
 
-Frag den Betreiber von `lpm.seolizer.de` nach einem Token und nenne dabei den
-Namensraum, unter dem du veröffentlichen willst (z. B. `net/`). Du bekommst
-eine Zeichenkette aus 64 Hexziffern. **Sie wird genau einmal angezeigt** — der
-Server speichert nur ihren Hash und kann sie nicht erneut ausgeben.
+Anfragen laufen über ein Issue im Repository:
+
+  → https://github.com/SEOLizer/Lyx-Package-Manager/issues
+
+Ein Titel, der mit `Token:` beginnt, macht die Anfrage auf den ersten Blick
+erkennbar — etwa `Token: Namensraum net/`.
+
+Vier Angaben gehören hinein, damit ohne Rückfragen entschieden werden kann:
+
+| Angabe | Wozu |
+|---|---|
+| **Namensraum** (z. B. `net/`) | Der Token wird darauf eingeschränkt. Ohne Angabe gälte `*` — das wird nicht vergeben |
+| **Publisher-Name** | Kurzname für die Token-Verwaltung; erscheint im Paketindex als `publisher` und ist damit öffentlich |
+| **Zweck bzw. geplantes Paket** | Ein, zwei Sätze. Namensraum-Konflikte fallen so früh auf, nicht erst beim ersten `publish` |
+| **Kontaktweg für die Übergabe** | Wohin der Token geschickt werden kann — siehe unten |
+
+Beispiel:
+
+```
+Titel: Token: Namensraum net/
+
+Namensraum:   net/
+Publisher:    anna
+Zweck:        HTTP-Client und ein kleiner URL-Parser; net/http und net/url
+Kontakt:      anna@example.org
+```
+
+> **Der Token gehört nicht ins Issue.** Ein GitHub-Issue ist öffentlich und
+> bleibt es auch nach dem Schließen. Im Issue wird nur die Anfrage verhandelt;
+> der Token geht über den dort genannten Kontaktweg zurück. Wer versehentlich
+> einen Token öffentlich gemacht hat, meldet das im selben Issue — er wird dann
+> entzogen und neu ausgestellt.
+
+Zurück kommt eine Zeichenkette aus 64 Hexziffern. **Sie wird genau einmal
+angezeigt** — der Server speichert nur ihren Hash und kann sie nicht erneut
+ausgeben. Geht sie verloren, wird der alte Zugang entzogen und ein neuer
+ausgestellt; bereits veröffentlichte Pakete bleiben davon unberührt.
 
 ### Als Betreiber
 
@@ -292,6 +365,30 @@ Das Skript liegt im Repo unter `deploy/lpm-token` und gehört nach
 `/etc/lpm/tokens.json`; wer die Datei liest, kann damit nichts hochladen.
 
 ---
+
+### Eine eigene Registry statt eines Tokens
+
+Für Pakete, die gar nicht öffentlich sein sollen, ist der Umweg über einen
+Token unnötig. Eine eigene Registry spricht `--registry=<url>` an — und rein
+lokal geht es ganz ohne:
+
+```console
+$ lpm pack
+$ lpm cache add ./demo_beispiel-1.2.0.lxpkg firma/intern 1.0.0
+lpm: firma/intern@1.0.0 entpackt nach /home/du/.lpm/cache/firma/intern/1.0.0
+
+$ lpm resolve firma.intern --entry --offline
+/home/du/.lpm/cache/firma/intern/1.0.0/beispiel.lyx
+```
+
+Das Paket ist damit auflösbar, **obwohl es in keiner Registry steht** — auch
+mit `--offline`. Für firmeninterne Units, Zwischenstände und Versuche ist das
+der kürzeste Weg; ein Token wird erst gebraucht, wenn andere das Paket über das
+Netz beziehen sollen.
+
+Zu beachten: Name und Version gibt hier der Aufrufer an, sie müssen nicht zum
+`lyx.toml` im Archiv passen. Welche Datei als Unit gilt, entscheidet weiterhin
+`[build] entry`.
 
 ## 5. Anmelden
 
@@ -377,6 +474,7 @@ $ lpm search http
 | Suchen (Name und Beschreibung) | `lpm search <text>` |
 | Details und Versionen | `lpm info <paket>` |
 | Gecachte Pakete anzeigen | `lpm cache list` |
+| Einzelnes Paket entfernen | `lpm cache remove <pkg> [<version>]` |
 | Cache leeren | `lpm cache clean` |
 | Ohne Netz arbeiten | jeder Befehl mit `--offline` |
 | Andere Registry | jeder Befehl mit `--registry=<url>` |

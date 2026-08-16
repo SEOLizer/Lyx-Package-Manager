@@ -84,6 +84,7 @@ lpm <subcommand> [optionen]
 | `lpm cache list` | Gecachte Pakete anzeigen | ✅ |
 | `lpm cache clean` | Lokalen Cache leeren | ✅ |
 | `lpm cache add <f> <n> <v>` | Lokales `.lxpkg` in den Cache entpacken | ✅ |
+| `lpm cache remove <n> [<v>]` | Einzelnes Paket aus dem Cache entfernen | ✅ |
 | `lpm install [<pkg[@ver]>]` | Auflösen, herunterladen, verifizieren, `lyx.lock` schreiben | ✅ |
 | `lpm remove <pkg>` | Paket aus `lyx.toml` entfernen, Lock neu schreiben | ✅ |
 | `lpm update [<pkg>]` | Index auffrischen und Pakete im Rahmen der Constraints aktualisieren | ✅ |
@@ -257,7 +258,7 @@ lyx-lpm/
       index.lyx            Parser für die Registry-Indizes (JSON)
       localcat.lyx         Katalog aus Cache und gespiegelten Indizes
       fetch.lyx            HTTPS-Transport, Spiegel, TTL, Upload
-      pack.lyx             .lxpkg bauen (reproduzierbar)
+      pack.lyx             .lxpkg bauen, undeklarierte Imports finden
       credentials.lyx      Registry-Token in ~/.lpm/credentials
   deploy/
     nginx-lpm.seolizer.de.conf   vhost der Registry
@@ -436,7 +437,7 @@ make test     # Resolver-, Index- und Fetch-Tests bauen und ausführen
 make clean    # Binary entfernen
 ```
 
-`make test` läuft ohne Netzwerk — 236 Fälle in fünf Suiten. Geprüft wird alles,
+`make test` läuft ohne Netzwerk — 243 Fälle in fünf Suiten. Geprüft wird alles,
 was sich ohne Gegenstelle entscheiden lässt: Auflösung, Index-Parser, sowie
 Namens-, Versions- und URL-Regeln, also genau die Entscheidungen, die *vor* dem
 ersten Byte auf der Leitung fallen.

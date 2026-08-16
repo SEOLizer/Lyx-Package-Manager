@@ -307,6 +307,66 @@ pub fn LpmCacheDropPkg(home: pchar, name: pchar, version: pchar): bool {
   return gone;
 }
 
+// Entfernt alle Versionen eines Pakets.
+//
+// Rueckgabe: Anzahl entfernter Versionen, oder -1 wenn das Paket gar nicht im
+// Cache liegt. Leergeraeumte Namens-Zwischenebenen (etwa "net" nach dem
+// Entfernen von "net/http") werden mit aufgeloest — sie stuenden sonst als
+// leere Verzeichnisse herum und taeuschten im Listing ein Paket vor.
+pub fn LpmCacheDropAll(home: pchar, name: pchar): int64 {
+  var dir: pchar := LpmCachePkgPath(home, name, 0 as pchar);
+  if !IsDirectory(dir) { LpmCacheFreePath(dir); return 0 - 1; }
+
+  var removed: int64 := 0;
+  var dl: int64 := LpmDirOpen(dir);
+  if dl != 0 {
+    var n: int64 := LpmDirCount(dl);
+    var i: int64 := 0;
+    while i < n {
+      if LpmDirType(dl, i) == LPD_DT_DIR {
+        var ename: pchar := LpmDirName(dl, i);
+        // Nur Versions-Ebenen anfassen: ein Unterverzeichnis, das nicht mit
+        // einer Ziffer beginnt, gehoert zu einem anderen Paket im selben
+        // Namensraum (net/http neben net/url).
+        if lpcIsVersionDir(ename) {
+          if LpmCacheDropPkg(home, name, ename) { removed := removed + 1; }
+        }
+      }
+      i := i + 1;
+    }
+    LpmDirClose(dl);
+  }
+
+  // Ist danach nichts mehr da, das Paketverzeichnis selbst entfernen.
+  Rmdir(dir);
+  LpmCacheFreePath(dir);
+
+  lpcPruneEmptyParents(home, name);
+  return removed;
+}
+
+// Entfernt leere Zwischenverzeichnisse eines hierarchischen Namens, von innen
+// nach aussen: "net/http" raeumt erst net/http, dann net — aber nur, solange
+// Rmdir gelingt, und das gelingt nur bei leeren Verzeichnissen.
+fn lpcPruneEmptyParents(home: pchar, name: pchar): void {
+  var buf: int64 := alloc(LPC_PATH_MAX);
+  var n: int64 := StrLen(name);
+  memcpy(buf, name as int64, n);
+  poke8(buf + n, 0);
+
+  var cut: int64 := n;
+  while cut > 0 {
+    cut := cut - 1;
+    if peek8(buf + cut) as int64 == 47 {
+      poke8(buf + cut, 0);
+      var p: pchar := LpmCachePkgPath(home, buf as pchar, 0 as pchar);
+      Rmdir(p);
+      LpmCacheFreePath(p);
+    }
+  }
+  free(buf, LPC_PATH_MAX);
+}
+
 // Leert ~/.lpm/cache/ vollstaendig, laesst das Verzeichnis selbst bestehen.
 // Rueckgabe: Exit-Code (0 = OK).
 pub fn LpmCacheCleanCmd(home: pchar): int64 {
