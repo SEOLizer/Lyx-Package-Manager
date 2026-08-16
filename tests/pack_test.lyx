@@ -252,6 +252,97 @@ fn testErrors(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Integritaetspruefung — FILES.sha256 gegen den Inhalt
+// ---------------------------------------------------------------------------
+//
+// Geprueft wird an einem frisch entpackten Paket: erst unveraendert, dann mit
+// je einer gezielten Beschaedigung. Das entpackte Paket steht noch von
+// testContents her unter tests-tmp/unpacked.
+
+fn testVerifyOk(): void {
+  outLn("Integritaet: unveraendert"c);
+  okInt("frisch entpackt"c, LpmVerifyPackage(UNP), LPA_VERIFY_OK);
+}
+
+fn testVerifyChanged(): void {
+  outLn("Integritaet: geaenderte Datei"c);
+
+  // Inhalt merken, um hinterher wiederherzustellen — die folgenden Tests
+  // bauen auf demselben Verzeichnis auf.
+  var orig: int64 := alloc(4096);
+  var n: int64 := ReadFile("tests-tmp/unpacked/base.lyx"c, orig as pchar, 4095);
+  poke8(orig + n, 0);
+
+  writeFile("tests-tmp/unpacked/base.lyx"c, "unit demo.base; // veraendert\n"c);
+  okInt("wird erkannt"c, LpmVerifyPackage(UNP), LPA_VERIFY_FAILED);
+  okStr("nennt die Datei"c, LpaVerifyBadFile(), "base.lyx"c);
+
+  WriteFile("tests-tmp/unpacked/base.lyx"c, orig as pchar, n);
+  okInt("nach dem Zuruecksetzen wieder gut"c, LpmVerifyPackage(UNP), LPA_VERIFY_OK);
+  free(orig, 4096);
+}
+
+fn testVerifyMissing(): void {
+  outLn("Integritaet: fehlende Datei"c);
+
+  var orig: int64 := alloc(4096);
+  var n: int64 := ReadFile("tests-tmp/unpacked/base.lyx"c, orig as pchar, 4095);
+
+  DeleteFile("tests-tmp/unpacked/base.lyx"c);
+  okInt("wird erkannt"c, LpmVerifyPackage(UNP), LPA_VERIFY_MISSING);
+  okStr("nennt die Datei"c, LpaVerifyBadFile(), "base.lyx"c);
+
+  WriteFile("tests-tmp/unpacked/base.lyx"c, orig as pchar, n);
+  free(orig, 4096);
+}
+
+fn testVerifyNoList(): void {
+  outLn("Integritaet: ohne FILES.sha256"c);
+
+  var orig: int64 := alloc(8192);
+  var n: int64 := ReadFile("tests-tmp/unpacked/FILES.sha256"c, orig as pchar, 8191);
+  DeleteFile("tests-tmp/unpacked/FILES.sha256"c);
+
+  // Kein Fehler: Pakete von vor `lpm pack` haben keine Liste. Der Aufrufer
+  // entscheidet, was er damit macht — lpm laesst sie durch.
+  okInt("gilt als nicht pruefbar"c, LpmVerifyPackage(UNP), LPA_VERIFY_NOLIST);
+
+  WriteFile("tests-tmp/unpacked/FILES.sha256"c, orig as pchar, n);
+  okInt("mit Liste wieder pruefbar"c, LpmVerifyPackage(UNP), LPA_VERIFY_OK);
+  free(orig, 8192);
+}
+
+fn testVerifyTraversal(): void {
+  outLn("Integritaet: praeparierte Liste"c);
+
+  var orig: int64 := alloc(8192);
+  var n: int64 := ReadFile("tests-tmp/unpacked/FILES.sha256"c, orig as pchar, 8191);
+
+  // Eine manipulierte Liste darf nicht dazu verleiten, ausserhalb des Pakets
+  // zu lesen — auch nicht, um dort "nur" zu hashen.
+  writeFile("tests-tmp/unpacked/FILES.sha256"c,
+            "0000000000000000000000000000000000000000000000000000000000000000  ../../../etc/passwd\n"c);
+  okInt("Traversal wird abgelehnt"c, LpmVerifyPackage(UNP), LPA_VERIFY_BROKEN);
+
+  writeFile("tests-tmp/unpacked/FILES.sha256"c,
+            "0000000000000000000000000000000000000000000000000000000000000000  /etc/passwd\n"c);
+  okInt("absoluter Pfad wird abgelehnt"c, LpmVerifyPackage(UNP), LPA_VERIFY_BROKEN);
+
+  WriteFile("tests-tmp/unpacked/FILES.sha256"c, orig as pchar, n);
+  free(orig, 8192);
+}
+
+fn testVerifyErrStr(): void {
+  outLn("Integritaet: Meldungen"c);
+  ok("OK"c,      LpmVerifyErrStr(LPA_VERIFY_OK) != 0 as pchar);
+  ok("NOLIST"c,  LpmVerifyErrStr(LPA_VERIFY_NOLIST) != 0 as pchar);
+  ok("FAILED"c,  LpmVerifyErrStr(LPA_VERIFY_FAILED) != 0 as pchar);
+  ok("MISSING"c, LpmVerifyErrStr(LPA_VERIFY_MISSING) != 0 as pchar);
+  ok("BROKEN"c,  LpmVerifyErrStr(LPA_VERIFY_BROKEN) != 0 as pchar);
+  ok("unbekannt"c, LpmVerifyErrStr(0 - 99) != 0 as pchar);
+}
+
+// ---------------------------------------------------------------------------
 // Dependencies als JSON — so gehen sie beim Veroeffentlichen an die Registry
 // ---------------------------------------------------------------------------
 
@@ -292,6 +383,12 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testArchiveName();
   testBuild();
   testContents();
+  testVerifyOk();
+  testVerifyChanged();
+  testVerifyMissing();
+  testVerifyNoList();
+  testVerifyTraversal();
+  testVerifyErrStr();
   testErrors();
   testDepsJson();
 

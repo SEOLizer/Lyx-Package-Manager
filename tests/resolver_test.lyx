@@ -49,6 +49,17 @@ fn okStr(name: pchar, got: pchar, want: pchar): void {
   }
 }
 
+fn okInt(name: pchar, got: int64, want: int64): void {
+  if got == want {
+    tsPass := tsPass + 1;
+    out("  ok   "c); outLn(name);
+  } else {
+    tsFail := tsFail + 1;
+    out("  FAIL "c); out(name); out("  erwartet="c); PrintInt(want);
+    out(" bekommen="c); PrintInt(got); outLn(""c);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // 1. Transitive Kette ueber drei Stufen: app -> net/http -> std/io -> std/core
 // ---------------------------------------------------------------------------
@@ -342,6 +353,117 @@ fn testDeterminism(): void {
 }
 
 // ---------------------------------------------------------------------------
+// LfDiff — die Grundlage der Aenderungsmeldung von `lpm update`
+// ---------------------------------------------------------------------------
+//
+// Geprueft wird die reine Vergleichslogik, ohne Datei und ohne Netz: zwei
+// LockFile-Objekte werden von Hand gefuellt und verglichen.
+
+con DIFF_MAX: int64 := 32;
+
+// Legt ein Lock mit den uebergebenen Paketen an. Die Argumente kommen paarweise
+// (Name, Version); ein leerer Name beendet die Liste.
+fn lockOf3(n1: pchar, v1: pchar, n2: pchar, v2: pchar, n3: pchar, v3: pchar): LockFile {
+  var lf: LockFile := new LockFile();
+  lf.LfInit();
+  if StrLen(n1) > 0 { lf.LfAddPkg(n1, v1, "sha"c, "src"c); }
+  if StrLen(n2) > 0 { lf.LfAddPkg(n2, v2, "sha"c, "src"c); }
+  if StrLen(n3) > 0 { lf.LfAddPkg(n3, v3, "sha"c, "src"c); }
+  return lf;
+}
+
+fn testDiffUnchanged(): void {
+  outLn("LfDiff: unveraendert"c);
+  var a: LockFile := lockOf3("demo/base"c, "1.0.0"c, "demo/mid"c, "1.1.0"c, ""c, ""c);
+  var b: LockFile := lockOf3("demo/base"c, "1.0.0"c, "demo/mid"c, "1.1.0"c, ""c, ""c);
+
+  var kinds: int64 := alloc(DIFF_MAX * 8);
+  var names: int64 := alloc(DIFF_MAX * 8);
+  var olds:  int64 := alloc(DIFF_MAX * 8);
+  var news:  int64 := alloc(DIFF_MAX * 8);
+
+  okInt("keine Aenderung"c, a.LfDiff(b, kinds, names, olds, news, DIFF_MAX), 0);
+
+  free(news, DIFF_MAX * 8); free(olds, DIFF_MAX * 8);
+  free(names, DIFF_MAX * 8); free(kinds, DIFF_MAX * 8);
+  a.LfFree(); dispose a; b.LfFree(); dispose b;
+}
+
+fn testDiffChanged(): void {
+  outLn("LfDiff: Version gewechselt"c);
+  var a: LockFile := lockOf3("demo/base"c, "1.0.0"c, "demo/mid"c, "1.1.0"c, ""c, ""c);
+  var b: LockFile := lockOf3("demo/base"c, "1.5.0"c, "demo/mid"c, "1.1.0"c, ""c, ""c);
+
+  var kinds: int64 := alloc(DIFF_MAX * 8);
+  var names: int64 := alloc(DIFF_MAX * 8);
+  var olds:  int64 := alloc(DIFF_MAX * 8);
+  var news:  int64 := alloc(DIFF_MAX * 8);
+
+  okInt("eine Aenderung"c, a.LfDiff(b, kinds, names, olds, news, DIFF_MAX), 1);
+  okInt("als CHANGED gemeldet"c, peek64(kinds), LF_DIFF_CHANGED);
+  okStr("richtiges Paket"c, peek64(names) as pchar, "demo/base"c);
+  okStr("alte Version"c, peek64(olds) as pchar, "1.0.0"c);
+  okStr("neue Version"c, peek64(news) as pchar, "1.5.0"c);
+
+  free(news, DIFF_MAX * 8); free(olds, DIFF_MAX * 8);
+  free(names, DIFF_MAX * 8); free(kinds, DIFF_MAX * 8);
+  a.LfFree(); dispose a; b.LfFree(); dispose b;
+}
+
+fn testDiffAddedRemoved(): void {
+  outLn("LfDiff: hinzu und weggefallen"c);
+  var a: LockFile := lockOf3("demo/base"c, "1.0.0"c, "demo/alt"c, "0.9.0"c, ""c, ""c);
+  var b: LockFile := lockOf3("demo/base"c, "1.0.0"c, "demo/neu"c, "2.0.0"c, ""c, ""c);
+
+  var kinds: int64 := alloc(DIFF_MAX * 8);
+  var names: int64 := alloc(DIFF_MAX * 8);
+  var olds:  int64 := alloc(DIFF_MAX * 8);
+  var news:  int64 := alloc(DIFF_MAX * 8);
+
+  okInt("zwei Aenderungen"c, a.LfDiff(b, kinds, names, olds, news, DIFF_MAX), 2);
+
+  // Reihenfolge: erst das neue Lock durchgehen (ADDED), dann das alte (REMOVED).
+  okInt("erst ADDED"c, peek64(kinds), LF_DIFF_ADDED);
+  okStr("das neue Paket"c, peek64(names) as pchar, "demo/neu"c);
+  ok("ADDED hat keine alte Version"c, peek64(olds) == 0);
+
+  okInt("dann REMOVED"c, peek64(kinds + 8), LF_DIFF_REMOVED);
+  okStr("das weggefallene"c, peek64(names + 8) as pchar, "demo/alt"c);
+  okStr("mit seiner letzten Version"c, peek64(olds + 8) as pchar, "0.9.0"c);
+  ok("REMOVED hat keine neue Version"c, peek64(news + 8) == 0);
+
+  free(news, DIFF_MAX * 8); free(olds, DIFF_MAX * 8);
+  free(names, DIFF_MAX * 8); free(kinds, DIFF_MAX * 8);
+  a.LfFree(); dispose a; b.LfFree(); dispose b;
+}
+
+fn testDiffEdges(): void {
+  outLn("LfDiff: Randfaelle"c);
+  var kinds: int64 := alloc(DIFF_MAX * 8);
+  var names: int64 := alloc(DIFF_MAX * 8);
+  var olds:  int64 := alloc(DIFF_MAX * 8);
+  var news:  int64 := alloc(DIFF_MAX * 8);
+
+  // Erster Lauf ueberhaupt: vorher leer, alles ist neu.
+  var leer: LockFile := lockOf3(""c, ""c, ""c, ""c, ""c, ""c);
+  var voll: LockFile := lockOf3("a/b"c, "1.0.0"c, "c/d"c, "2.0.0"c, ""c, ""c);
+  okInt("aus leer wird alles ADDED"c,
+        leer.LfDiff(voll, kinds, names, olds, news, DIFF_MAX), 2);
+
+  // Und umgekehrt: alles weg.
+  okInt("nach leer ist alles REMOVED"c,
+        voll.LfDiff(leer, kinds, names, olds, news, DIFF_MAX), 2);
+  okInt("Art stimmt"c, peek64(kinds), LF_DIFF_REMOVED);
+
+  // Die Obergrenze wird eingehalten, statt ueber das Array hinauszuschreiben.
+  okInt("max wird beachtet"c, voll.LfDiff(leer, kinds, names, olds, news, 1), 1);
+
+  leer.LfFree(); dispose leer; voll.LfFree(); dispose voll;
+  free(news, DIFF_MAX * 8); free(olds, DIFF_MAX * 8);
+  free(names, DIFF_MAX * 8); free(kinds, DIFF_MAX * 8);
+}
+
+// ---------------------------------------------------------------------------
 
 pub fn main(argc: int64, argv: pchar): int64 {
   outLn("resolver tests"c);
@@ -356,6 +478,10 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testTighten();
   testToLock();
   testDeterminism();
+  testDiffUnchanged();
+  testDiffChanged();
+  testDiffAddedRemoved();
+  testDiffEdges();
 
   outLn(""c);
   out("bestanden: "c); PrintInt(tsPass);
