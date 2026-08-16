@@ -6,7 +6,7 @@ an `lyxc` sind hier nicht umgesetzt** — sie gehören ins Compiler-Repository u
 liegen beim Compiler-Team. Was hier steht, ist die Schnittstelle von `lpm` aus
 gesehen, samt der Fundstellen, die eine Umsetzung betreffen würde.
 
-Stand: 2026-08-15, `lpm` 0.1.0, `lyxc` 1.0.19E.
+Stand: 2026-08-16, `lpm` 0.1.0, `lyxc` 1.0.20F.
 
 ---
 

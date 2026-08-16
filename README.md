@@ -406,6 +406,10 @@ Bereits umgesetzt:
 - Paketnamen und Versionen werden auf Pfad-Traversal geprüft, bevor sie in einen
   URL- oder Dateipfad gehen; ebenso jeder Pfad im tar-Archiv
 - `http://` als Registry wird abgelehnt statt still auf TLS hochgestuft
+- Ein Paket aus dem Cache wird gegen sein `FILES.sha256` geprüft, bevor es
+  benutzt wird. Weicht eine Datei ab, wird das Paket verworfen und neu geholt —
+  der sha256 aus `lyx.lock` deckt nur den Weg bis in den Cache ab, nicht das,
+  was danach dort passiert
 
 Bekannter Trade-off: mit `std.net.https` kommt OpenSSL per FFI ins Binary, damit
 ist `lpm` dynamisch gelinkt und verliert RELRO — Sicherheits-Score 30/35 statt
@@ -432,7 +436,7 @@ make test     # Resolver-, Index- und Fetch-Tests bauen und ausführen
 make clean    # Binary entfernen
 ```
 
-`make test` läuft ohne Netzwerk — 202 Fälle in fünf Suiten. Geprüft wird alles,
+`make test` läuft ohne Netzwerk — 236 Fälle in fünf Suiten. Geprüft wird alles,
 was sich ohne Gegenstelle entscheiden lässt: Auflösung, Index-Parser, sowie
 Namens-, Versions- und URL-Regeln, also genau die Entscheidungen, die *vor* dem
 ersten Byte auf der Leitung fallen.
@@ -493,6 +497,17 @@ HOME=/tmp/lpmtest ./bin/lpm cache list
   `fcntl`, `poll` und `uname`. Seit `lyxc` 1.0.19E läuft HTTPS durch.
 - **`chmod` braucht seit `lyxc` 1.0.13J die Capability `fs.perm`** — ohne sie
   SIGSYS. `lpm` benutzt es nicht, aber die Regel gilt für jeden Konsumenten.
+- **Doppelt definierte private `fn` werden nicht gemeldet**
+  ([#1567](https://github.com/SEOLizer/LyX-Compiler/issues/1567)): bleibt beim
+  Umbau eine alte Fassung im File stehen, bindet der Aufruf an die *erste*
+  Definition — ohne Prüfung der Argumentzahl. Die fehlenden Argumente kommen als
+  Stack-Müll an. Bei `pub fn` greift die Prüfung, bei privaten in einer
+  importierten Unit nicht.
+- **`-I` kennt nur einen Pfad.** Mehrere `-I` überschreiben sich, der letzte
+  gewinnt (`includePath` ist ein einzelner `pchar`). Im `make`-Build fällt das
+  nicht auf, weil die Quellen im Repo liegen und relativ aufgelöst werden — ein
+  Testprogramm außerhalb zieht dagegen stillschweigend Units aus dem
+  `aurum`-Baum, der eigene ältere Kopien von `lpm/core/*` enthält.
 - **`&&` schließt in `lyxc` nicht kurz.** `if p != null && deref(p)` wertet
   beide Seiten aus und segfaultet bei Nullzeigern. Null-Checks müssen
   geschachtelt werden.

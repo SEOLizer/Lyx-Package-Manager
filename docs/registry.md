@@ -3,8 +3,9 @@
 Die öffentliche Registry für `lpm` läuft unter **https://lpm.seolizer.de**.
 
 Sie ist bewusst als *statische* Registry entworfen: alles, was `lpm install`
-braucht, sind `GET`-Requests auf gewöhnliche Dateien. Erst `lpm publish`
-(PM-08) benötigt serverseitige Logik.
+braucht, sind `GET`-Requests auf gewöhnliche Dateien. Nur `lpm publish`
+benötigt serverseitige Logik — der Endpunkt läuft, siehe
+[`../deploy/README.md`](../deploy/README.md).
 
 ---
 
@@ -16,7 +17,7 @@ braucht, sind `GET`-Requests auf gewöhnliche Dateien. Erst `lpm publish`
 | `/packages/<name>/index.json` | Versionsliste eines Pakets | `application/json` |
 | `/packages/<name>/<version>.lxpkg` | Paket-Archiv (tar.zst) | `application/octet-stream` |
 | `/keys/<publisher>.pub` | Ed25519-Publisher-Key (TOFU) | `text/plain` |
-| `/api/v1/publish` | Upload (PM-08, `POST`, Auth erforderlich) | `application/json` |
+| `/api/v1/publish` | Upload (`POST`, Bearer-Token erforderlich) | `application/json` |
 
 `<name>` ist der hierarchische Paketname und wird **unverändert** als Pfad
 verwendet: `net/http` → `/packages/net/http/1.2.0.lxpkg`. Erlaubte Zeichen sind
@@ -76,7 +77,7 @@ Der Client unterscheidet nur nach HTTP-Status:
 | Status | Bedeutung für `lpm` |
 |--------|---------------------|
 | 200 | ok |
-| 304 | Spiegel ist aktuell (`If-None-Match`) |
+| 304 | Spiegel ist aktuell (`If-None-Match`) — vom Client noch nicht genutzt, siehe unten |
 | 404 | Paket bzw. Version existiert nicht |
 | 4xx sonst | Client-Fehler, Abbruch mit Meldung |
 | 5xx | Registry-Fehler, Abbruch (kein Retry in M2) |
@@ -86,7 +87,21 @@ Der Client unterscheidet nur nach HTTP-Status:
 `sha256` aus `/packages/<name>/index.json` wird beim Download geprüft und in
 `lyx.lock` gepinnt. Weicht ein späterer Download vom Lock-Eintrag ab, bricht
 `lpm` ab — der Lock-Eintrag hat immer Vorrang gegenüber der Registry-Angabe.
+Zusätzlich prüft der Client ein Paket, das er aus dem Cache benutzt, gegen das
+`FILES.sha256` im Paket selbst. Der gepinnte sha256 deckt nur den Weg vom Server
+bis in den Cache ab; eine dort nachträglich geänderte Datei fiele sonst nie auf.
+Das ersetzt keine Signatur — die Liste liegt im selben Archiv wie die Dateien.
+
 Signaturprüfung (`SIGNATURE.ed25519`, `/keys/<publisher>.pub`) folgt in PM-10.
+
+## Was der Client vom Protokoll noch nicht nutzt
+
+Die ETag-Revalidierung (`If-None-Match` → 304) ist im Client vorbereitet, aber
+abgeschaltet: `std.net.https` füllt die Response-Header nicht
+([LyX-Compiler#1534](https://github.com/SEOLizer/LyX-Compiler/issues/1534)), es
+gibt also keine Quelle für den ETag. Die Auffrischung trägt bis dahin allein die
+Zeit-TTL von einer Stunde. Serverseitig ist alles vorhanden — nginx setzt `ETag`
+und `Cache-Control: no-cache`.
 
 ---
 

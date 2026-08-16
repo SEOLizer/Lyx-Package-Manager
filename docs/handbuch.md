@@ -410,6 +410,26 @@ $ lpm update demo/base
 Alle übrigen Einträge aus `lyx.lock` werden dabei auf ihrer Version
 festgehalten.
 
+### Der Cache wird geprüft
+
+Ein Paket aus `~/.lpm/cache` wird vor dem Benutzen gegen sein `FILES.sha256`
+geprüft. Weicht eine Datei ab, wird das Paket verworfen und neu geholt:
+
+```console
+$ lpm install
+lpm: warning: demo/base@1.0.0: Datei im Cache wurde veraendert (base.lyx)
+     wird verworfen und neu geholt.
+lpm: hole demo/base@1.0.0 von https://lpm.seolizer.de
+```
+
+Der sha256 in `lyx.lock` deckt nur den Weg vom Server bis in den Cache ab —
+was danach dort passiert, sähe sonst niemand. Mit `--offline` bleibt es bei der
+Meldung, weil die heile Fassung nicht erreichbar ist.
+
+Pakete ohne `FILES.sha256` (von vor `lpm pack`) gelten als nicht prüfbar und
+werden durchgelassen; unter `--verbose` steht ein Hinweis. Ein Signaturersatz
+ist das nicht: die Liste liegt im selben Archiv wie die Dateien.
+
 **Der Index wird eine Stunde lang gespiegelt.** Innerhalb dieser Zeit fragt
 `search` und `info` nicht erneut nach; `lpm update` umgeht die Frist.
 
