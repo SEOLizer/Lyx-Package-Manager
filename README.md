@@ -6,7 +6,7 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 
 `lpm` ist selbst vollständig in Lyx geschrieben und wird mit `lyxc` übersetzt.
 
-> **Status: frühe Entwicklung (v0.1.0).** Der Install-Flow läuft end-to-end gegen
+> **Status: frühe Entwicklung (v0.1.2).** Der Install-Flow läuft end-to-end gegen
 > die öffentliche Registry: leerer Cache → Index per HTTPS → Auflösung → Archiv
 > per HTTPS → SHA256-Prüfung → entpackt im Cache. Funktionsfähig sind `init`,
 > `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list`,
@@ -180,9 +180,17 @@ description = "HTTP client and server for Lyx"
 
 [build]
 entry = "http.lyu"
+
+[build.units]
+json = "json.lyx"
 ```
 
 Unterstützte SemVer-Ranges: `^`, `~`, `>=`, `=`.
+`[build.units]` ist optional und nennt weitere Units desselben Pakets, die
+einzeln importierbar sein sollen: der Schlüssel ist das Namenssegment hinter
+dem Paketnamen (`import net.http.json`), der Wert die Datei im
+Paketverzeichnis. Ein eigenständiges Paket gleichen Namens hat beim Auflösen
+Vorrang.
 Paketnamen sind hierarchisch (`net/http`) und passen damit direkt zur
 Lyx-Import-Syntax. Erlaubte Zeichen: `[a-z0-9_/.-]`.
 

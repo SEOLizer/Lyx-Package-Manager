@@ -1,7 +1,7 @@
 # lpm — Handbuch
 
 Vom leeren Verzeichnis bis zum veröffentlichten Paket. Alle Beispiele sind
-gegen `lpm 0.1.0` und `https://lpm.seolizer.de` ausgeführt.
+gegen `lpm 0.1.2` und `https://lpm.seolizer.de` ausgeführt.
 
 Die Serverseite (Registry einrichten, vhost, Token-Datei) steht in
 [`../deploy/README.md`](../deploy/README.md).
@@ -40,7 +40,7 @@ Prüfen:
 
 ```console
 $ lpm --version
-lpm 0.1.0
+lpm 0.1.2
 ```
 
 Systemweit ginge `sudo make install` (nach `/usr/local/bin`), entfernen mit
@@ -146,7 +146,9 @@ entry = "http.lyx"        # welche Datei die Unit ist
 Großbuchstaben, keine Leerzeichen, keine `..`-Segmente.
 
 **`entry`** sagt `lpm resolve`, welche Datei die Unit ist. Fehlt der Eintrag,
-wird `<letztes Namenssegment>.lyx` gesucht, danach `.lyu`.
+wird `<letztes Namenssegment>.lyx` gesucht, danach `.lyu`. Ein Paket mit
+mehreren einzeln importierbaren Units trägt zusätzlich `[build.units]` ein —
+siehe „Mehrere Units" weiter unten.
 
 Bauen:
 
@@ -255,12 +257,52 @@ for d in http json tls buffer; do (cd "$d" && lpm publish); done
 `buffer.lyx` Innereien von `demo/http` sind und niemand sie einzeln einbinden
 soll.
 
-> **Einschränkung, die man kennen muss:** `lpm resolve` liefert pro Paket
-> genau *eine* Datei. Schreibt jemand `import demo.json`, sucht `lpm` ein
-> Paket namens `demo/json` — und findet keins, auch wenn `json.lyx` in
-> `demo/http` steckt. Mit-Units sind also nur innerhalb ihres Pakets
-> brauchbar. Für öffentlich importierbare Units führt kein Weg an einem
-> eigenen Verzeichnis vorbei.
+**Beides — ein Paket, trotzdem einzeln importierbar.** Dafür gibt es
+`[build.units]`:
+
+```toml
+[package]
+name    = "vega"
+version = "0.1.0"
+
+[build]
+entry = "vega.lyx"
+
+[build.units]
+types = "types.lyx"
+core  = "core.lyx"
+```
+
+Der Schlüssel ist das Namenssegment **hinter** dem Paketnamen, der Wert die
+Datei im Paketverzeichnis. `import vega.types` löst damit auf:
+
+```console
+$ lpm resolve vega.types --entry
+/home/du/.lpm/cache/vega/0.1.0/types.lyx
+```
+
+Was dabei zu wissen ist:
+
+- **Ein eigenständiges Paket hat Vorrang.** `lpm resolve vega.types` sucht
+  zuerst ein Paket `vega/types`. Erst wenn es keins gibt, wird `vega` befragt
+  und dort in `[build.units]` nachgeschlagen. Ein später veröffentlichtes
+  `vega/types` übernimmt also, ohne dass jemand seine Importe ändert.
+- **Der Schlüssel wird verglichen, wie er dasteht** — dieselbe Schreibweise
+  wie im Import. Paketnamen sind ohnehin klein zu schreiben (siehe oben),
+  also auch die Schlüssel.
+- **`pack` prüft die Tabelle.** Zeigt ein Eintrag auf eine Datei, die es nicht
+  gibt, bricht `lpm pack` ab — das ist ein Fehler, keine Warnung, denn beim
+  Anwender wäre das Paket längst veröffentlicht.
+- **Ohne `--entry`** kommt das Paketverzeichnis heraus, aber nur, wenn die
+  Unit wirklich in der Tabelle steht. `lpm resolve vega.beliebig` schlägt
+  fehl, statt kommentarlos das Verzeichnis von `vega` auszugeben.
+- **Die Tabelle steht nur in der `lyx.toml` des Pakets**, nicht im
+  Registry-Index. Sie wird beim Auflösen aus dem entpackten Paket gelesen —
+  an der Registry ändert sich nichts.
+
+Nicht eingetragene Mit-Units bleiben, was sie waren: nur innerhalb ihres
+Pakets brauchbar. Wer `json.lyx` als Innerei von `demo/http` behalten will,
+lässt es einfach aus `[build.units]` heraus.
 
 Einen Workspace-Modus, der mehrere Pakete eines Repositories gemeinsam
 verwaltet und in einem Rutsch veröffentlicht, gibt es noch nicht (WP-PM-11).

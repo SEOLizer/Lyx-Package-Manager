@@ -114,7 +114,7 @@ fn cmdGetHome(argc: int64, argv: pchar): pchar {
 // ---------------------------------------------------------------------------
 
 fn lpmHelp(): void {
-  cmdOutLn("lpm 0.1.0 — Lyx Package Manager"c);
+  cmdOutLn("lpm 0.1.2 — Lyx Package Manager"c);
   cmdOutLn(""c);
   cmdOutLn("Verwendung: lpm <subcommand> [optionen]"c);
   cmdOutLn(""c);
@@ -152,7 +152,7 @@ fn lpmHelp(): void {
 // ---------------------------------------------------------------------------
 
 fn lpmVersion(): void {
-  cmdOutLn("lpm 0.1.0"c);
+  cmdOutLn("lpm 0.1.2"c);
 }
 
 // ---------------------------------------------------------------------------
@@ -607,7 +607,15 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
     cmdAddRoots(mf, r);
 
     rc := r.RsResolve();
-    if rc != RS_ERR_MISSING { break; }
+    // MISSING: das Paket kennt der Katalog gar nicht.
+    // CONFLICT: er kennt es, aber womoeglich nur in einem veralteten Stand —
+    // die erloesende Version steht dann in der Registry, nicht im Spiegel.
+    // Beides ist ein Grund, den Paket-Index nachzuladen und noch einmal
+    // aufzuloesen. Ohne den CONFLICT-Fall bricht die Aufloesung ab, bevor sie
+    // den Server ueberhaupt fragt.
+    if rc != RS_ERR_MISSING {
+      if rc != RS_ERR_CONFLICT { break; }
+    }
     if ctx.lcOffline { break; }
     if seenN >= CMD_SYNC_MAX { break; }
 
@@ -623,7 +631,12 @@ fn cmdResolveAndLock(ctx: LpmCtx, home: pchar, mf: Manifest): int64 {
 
     // Erst holen, dann freigeben: bringt der Download nichts Neues, bleibt das
     // vorhandene Ergebnis samt Fehlerkontext stehen und wird gemeldet.
-    if !cmdSyncIndex(ctx, home, name, false) { break; }
+    // Bei einem Konflikt die TTL uebergehen: der Spiegel gilt als frisch,
+    // beantwortet die Frage aber nachweislich nicht — sonst liefe die
+    // Aufloesung eine Stunde lang in denselben Fehler.
+    var forceSync: bool := false;
+    if rc == RS_ERR_CONFLICT { forceSync := true; }
+    if !cmdSyncIndex(ctx, home, name, forceSync) { break; }
 
     r.RsFree(); dispose r;
     cat.DcFree(); dispose cat;
@@ -1016,6 +1029,24 @@ fn lpmUpdate(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   before.LfInit();
   var hadLock: bool := false;
   if FileExists("lyx.lock"c) { hadLock := before.LfRead("lyx.lock"c); }
+
+  // Auch die transitiven Pakete auffrischen. Sie stehen nicht in lyx.toml,
+  // wohl aber in lyx.lock — ohne sie sieht der Resolver fuer alles unterhalb
+  // der Wurzeln weiter den Stand von vor der TTL.
+  if hadLock {
+    var li: int64 := 0;
+    while li < before.LfCount() {
+      var ln: pchar := before.LfGetName(li);
+      var isRoot: bool := false;
+      var dj: int64 := 0;
+      while dj < mf.MfDepCount() {
+        if StrCmp(mf.MfDepName(dj), ln) == 0 { isRoot := true; }
+        dj := dj + 1;
+      }
+      if !isRoot { cmdSyncIndex(ctx, home, ln, true); }
+      li := li + 1;
+    }
+  }
 
   // Mit Paketnamen: alles ausser diesem Paket auf der Lock-Version festhalten.
   var only: pchar := ctx.LcSubArg(0);
@@ -1476,6 +1507,150 @@ fn cmdEntryPath(dir: pchar, name: pchar, out: int64, cap: int64): bool {
   return false;
 }
 
+// Zerlegt "Vega/Types" in Elternpaket "Vega" und Segment "Types".
+// Rueckgabe: Zeiger auf das letzte Segment innerhalb von name, oder 0, wenn
+// der Name nur aus einem Segment besteht (dann gibt es kein Elternpaket).
+fn cmdSplitParent(name: pchar, out: int64, cap: int64): pchar {
+  var n: int64 := StrLen(name);
+  var cut: int64 := 0 - 1;
+  var i: int64 := 0;
+  while i < n {
+    if peek8(name as int64 + i) as int64 == 47 { cut := i; }
+    i := i + 1;
+  }
+  if cut <= 0 { return 0 as pchar; }
+  if cut + 1 >= cap { return 0 as pchar; }
+  if cut + 1 >= n { return 0 as pchar; }
+  memcpy(out, name as int64, cut);
+  poke8(out + cut, 0);
+  return (name as int64 + cut + 1) as pchar;
+}
+
+// Sucht die Datei einer Zusatz-Unit in einem entpackten Paket.
+//
+// Das ist der Fall "mehrere Units in einem Paket": `import Vega.Types` findet
+// kein Paket Vega/Types, wohl aber ein Paket Vega, dessen lyx.toml unter
+// [build.units] sagt, welche Datei die Unit Types ist. Ohne diese Tabelle
+// waere die Unit nur paketintern brauchbar.
+fn cmdUnitPath(dir: pchar, sub: pchar, out: int64, cap: int64): bool {
+  var toml: int64 := alloc(CMD_PATH_MAX);
+  var p: int64 := 0;
+  p := cmdWrS(toml, p, dir);
+  p := cmdWrS(toml, p, "/lyx.toml"c);
+  poke8(toml + p, 0);
+
+  if !FileExists(toml as pchar) {
+    free(toml, CMD_PATH_MAX);
+    return false;
+  }
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  var ok: bool := false;
+  if mf.MfRead(toml as pchar) {
+    var f: pchar := mf.MfFindUnit(sub);
+    if f != 0 as pchar {
+      if peek8(f as int64) as int64 != 0 {
+        p := 0;
+        p := cmdWrS(out, p, dir);
+        p := cmdWrS(out, p, "/"c);
+        p := cmdWrS(out, p, f);
+        poke8(out + p, 0);
+        ok := FileExists(out as pchar);
+      }
+    }
+  }
+  mf.MfFree(); dispose mf;
+  free(toml, CMD_PATH_MAX);
+  return ok;
+}
+
+// Schreibt das Ergebnis einer Aufloesung auf stdout.
+//
+// sub == 0: das Paket selbst, wie bisher. Sonst eine Zusatz-Unit aus
+// [build.units] — dann muss die Unit auch dann in der Tabelle stehen, wenn nur
+// das Verzeichnis gefragt ist: sonst wuerde `lpm resolve Vega.Beliebig` das
+// Verzeichnis von Vega ausgeben, obwohl es die Unit nicht gibt.
+fn cmdPrintResolved(home: pchar, pkg: pchar, version: pchar, sub: pchar,
+                    entry: bool): bool {
+  if sub == 0 as pchar { return cmdPrintCachePath(home, pkg, version, entry); }
+
+  var dir: pchar := LpmCachePkgPath(home, pkg, version);
+  var file: int64 := alloc(CMD_PATH_MAX);
+  var ok: bool := cmdUnitPath(dir, sub, file, CMD_PATH_MAX);
+
+  if ok {
+    if entry {
+      sys_write(1, file, StrLen(file as pchar));
+    } else {
+      sys_write(1, dir as int64, StrLen(dir));
+    }
+    sys_write(1, "\n"c as int64, 1);
+  }
+  free(file, CMD_PATH_MAX);
+  LpmCacheFreePath(dir);
+  return ok;
+}
+
+// Schneller Weg: Version steht im Lock, Paket liegt geprueft im Cache.
+// Fasst weder Netz noch Uhr an — das ist der haeufigste Fall waehrend einer
+// Kompilierung. false heisst nur "so nicht", nicht "Fehler"; der Aufrufer
+// probiert danach die vollstaendige Aufloesung.
+fn cmdResolveFromCache(ctx: LpmCtx, home: pchar, pkg: pchar, sub: pchar,
+                       entry: bool): bool {
+  var ver: int64 := alloc(CMD_NAME_MAX);
+  var ok: bool := false;
+  if cmdLockedVersion(pkg, ver, CMD_NAME_MAX) {
+    if LpmCacheHas(home, pkg, ver as pchar) {
+      // Gegen FILES.sha256 pruefen: der Compiler bekommt gleich einen Pfad,
+      // aus dem er uebersetzt. Schlaegt die Pruefung an, faellt der Aufruf in
+      // die vollstaendige Aufloesung und holt das Paket neu.
+      cmdOutFd := 2;
+      var cached: bool := cmdVerifyCached(ctx, home, pkg, ver as pchar);
+      cmdOutFd := 1;
+      if cached { ok := cmdPrintResolved(home, pkg, ver as pchar, sub, entry); }
+    }
+  }
+  free(ver, CMD_NAME_MAX);
+  return ok;
+}
+
+// Vollstaendiger Weg: aufloesen wie bei `install`, inklusive Download,
+// Hash-Pruefung und Lock-Aktualisierung. Der Compiler bekommt damit ein Paket,
+// das auch ein spaeteres `lpm install` genau so herstellen wuerde.
+fn cmdResolveViaRegistry(ctx: LpmCtx, home: pchar, pkg: pchar, sub: pchar,
+                         entry: bool): bool {
+  var ver: int64 := alloc(CMD_NAME_MAX);
+  var locked: bool := cmdLockedVersion(pkg, ver, CMD_NAME_MAX);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  cmdLoadManifest(mf);
+
+  var cons: pchar := "*"c;
+  if locked { cons := ver as pchar; }
+  mf.MfSetDep(pkg, cons);
+
+  cmdOutFd := 2;
+  var rc: int64 := cmdResolveAndLock(ctx, home, mf);
+  cmdOutFd := 1;
+  mf.MfFree(); dispose mf;
+  free(ver, CMD_NAME_MAX);
+
+  if rc != CMD_RES_OK { return false; }
+
+  // Version aus dem frisch geschriebenen Lock nehmen.
+  var ver2: int64 := alloc(CMD_NAME_MAX);
+  var ok: bool := false;
+  if cmdLockedVersion(pkg, ver2, CMD_NAME_MAX) {
+    if LpmCacheHas(home, pkg, ver2 as pchar) {
+      ok := cmdPrintResolved(home, pkg, ver2 as pchar, sub, entry);
+    }
+  }
+  free(ver2, CMD_NAME_MAX);
+  return ok;
+}
+
 fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   var arg: pchar := ctx.LcSubArg(0);
   if arg == 0 as pchar {
@@ -1501,85 +1676,48 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   }
   var pkg: pchar := name as pchar;
 
-  // 1. Steht die Version im Lock und liegt sie im Cache? Dann sofort fertig —
-  //    das ist der haeufigste Fall waehrend einer Kompilierung und darf weder
-  //    das Netz noch die Uhr anfassen.
-  var ver: int64 := alloc(CMD_NAME_MAX);
-  var locked: bool := cmdLockedVersion(pkg, ver, CMD_NAME_MAX);
-  if locked {
-    // Auch hier gegen FILES.sha256 pruefen: der Compiler bekommt gleich einen
-    // Pfad, aus dem er uebersetzt. Schlaegt die Pruefung an, faellt der Aufruf
-    // in die vollstaendige Aufloesung unten und holt das Paket neu.
-    var cached: bool := false;
-    if LpmCacheHas(home, pkg, ver as pchar) {
-      cmdOutFd := 2;
-      cached := cmdVerifyCached(ctx, home, pkg, ver as pchar);
-      cmdOutFd := 1;
-    }
-    if cached {
-      if cmdPrintCachePath(home, pkg, ver as pchar, wantEntry) {
-        free(ver, CMD_NAME_MAX);
-        free(name, CMD_NAME_MAX);
-        return 0;
-      }
-      cmdEOut("lpm: error: "c); cmdEOut(pkg);
-      cmdEOutLn(": keine Unit-Datei im Paket gefunden."c);
-      free(ver, CMD_NAME_MAX);
-      free(name, CMD_NAME_MAX);
-      return 1;
+  // Zusatz-Units: findet sich kein Paket dieses Namens, kann die Unit als
+  // Datei in ihrem Elternpaket liegen und dort unter [build.units] stehen —
+  // "Vega/Types" also als Unit Types im Paket Vega. Das Elternpaket wird nur
+  // ersatzweise befragt: ein eigenstaendiges Paket hat immer Vorrang.
+  var parent: int64 := alloc(CMD_NAME_MAX);
+  var seg: pchar := cmdSplitParent(pkg, parent, CMD_NAME_MAX);
+  var par: pchar := parent as pchar;
+
+  // 1. Beides zuerst aus Lock und Cache — ohne Netz und ohne Uhr. Das ist der
+  //    haeufigste Fall waehrend einer Kompilierung.
+  var done: bool := cmdResolveFromCache(ctx, home, pkg, 0 as pchar, wantEntry);
+  if !done {
+    if seg != 0 as pchar {
+      done := cmdResolveFromCache(ctx, home, par, seg, wantEntry);
     }
   }
 
-  // 2. Sonst aufloesen wie bei `install` — inklusive Download, Hash-Pruefung
-  //    und Lock-Aktualisierung. Der Compiler bekommt damit ein Paket, das auch
-  //    ein spaeteres `lpm install` genau so herstellen wuerde.
-  var mf: Manifest := new Manifest();
-  mf.MfInit();
-  cmdLoadManifest(mf);
+  // 2. Sonst vollstaendig aufloesen, wieder Paket vor Zusatz-Unit.
+  if !done { done := cmdResolveViaRegistry(ctx, home, pkg, 0 as pchar, wantEntry); }
+  if !done {
+    if seg != 0 as pchar {
+      done := cmdResolveViaRegistry(ctx, home, par, seg, wantEntry);
+    }
+  }
 
-  var cons: pchar := "*"c;
-  if locked { cons := ver as pchar; }
-  mf.MfSetDep(pkg, cons);
-
-  cmdOutFd := 2;
-  var rc: int64 := cmdResolveAndLock(ctx, home, mf);
-  cmdOutFd := 1;
-  mf.MfFree(); dispose mf;
-  free(ver, CMD_NAME_MAX);
-
-  if rc != CMD_RES_OK {
+  if !done {
     cmdEOut("lpm: error: "c); cmdEOut(pkg);
-    cmdEOutLn(" liess sich nicht aufloesen."c);
+    if seg != 0 as pchar {
+      cmdEOut(" liess sich nicht aufloesen: kein solches Paket, und "c);
+      cmdEOut(par);
+      cmdEOut(" fuehrt \""c); cmdEOut(seg);
+      cmdEOutLn("\" nicht unter [build.units]."c);
+    } else {
+      cmdEOutLn(" liess sich nicht aufloesen."c);
+    }
+    free(parent, CMD_NAME_MAX);
     free(name, CMD_NAME_MAX);
     return 1;
   }
 
-  // 3. Version aus dem frisch geschriebenen Lock nehmen.
-  var ver2: int64 := alloc(CMD_NAME_MAX);
-  var ok: bool := cmdLockedVersion(pkg, ver2, CMD_NAME_MAX);
-  if !ok {
-    cmdEOut("lpm: error: "c); cmdEOut(pkg);
-    cmdEOutLn(" steht nach der Aufloesung nicht in lyx.lock."c);
-    free(ver2, CMD_NAME_MAX);
-    free(name, CMD_NAME_MAX);
-    return 1;
-  }
-  if !LpmCacheHas(home, pkg, ver2 as pchar) {
-    cmdEOut("lpm: error: "c); cmdEOut(pkg);
-    cmdEOutLn(" ist aufgeloest, liegt aber nicht im Cache."c);
-    free(ver2, CMD_NAME_MAX);
-    free(name, CMD_NAME_MAX);
-    return 1;
-  }
-
-  var printed: bool := cmdPrintCachePath(home, pkg, ver2 as pchar, wantEntry);
-  free(ver2, CMD_NAME_MAX);
+  free(parent, CMD_NAME_MAX);
   free(name, CMD_NAME_MAX);
-  if !printed {
-    cmdEOut("lpm: error: "c); cmdEOut(pkg);
-    cmdEOutLn(": keine Unit-Datei im Paket gefunden."c);
-    return 1;
-  }
   return 0;
 }
 
@@ -1607,6 +1745,34 @@ fn cmdWarnImports(dir: pchar, mf: Manifest): void {
     cmdOutLn("     lpm install <paket>"c);
   }
   PkUndeclaredFree();
+}
+
+// Prueft, dass jede Datei aus [build.units] wirklich im Paket liegt.
+//
+// Ein Fehler, keine Warnung: die Tabelle ist das Versprechen, unter dem
+// Fremdcode `import Vega.Types` schreibt. Faellt sie beim Anwender auf die
+// Nase, ist das Paket schon veroeffentlicht.
+fn cmdCheckUnits(dir: pchar, mf: Manifest): bool {
+  var path: int64 := alloc(CMD_PATH_MAX);
+  var ok: bool := true;
+  var i: int64 := 0;
+  while i < mf.MfUnitCount() {
+    var f: pchar := mf.MfUnitFile(i);
+    var p: int64 := 0;
+    p := cmdWrS(path, p, dir);
+    p := cmdWrS(path, p, "/"c);
+    p := cmdWrS(path, p, f);
+    poke8(path + p, 0);
+    if !FileExists(path as pchar) {
+      cmdEOut("lpm: error: [build.units] "c); cmdEOut(mf.MfUnitName(i));
+      cmdEOut(" verweist auf "c); cmdEOut(f);
+      cmdEOutLn(" — diese Datei gibt es nicht."c);
+      ok := false;
+    }
+    i := i + 1;
+  }
+  free(path, CMD_PATH_MAX);
+  return ok;
 }
 
 fn lpmPack(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
@@ -1646,6 +1812,11 @@ fn lpmPack(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   if pver  != 0 as pchar { if peek8(pver  as int64) as int64 != 0 { haveVer  := true; } }
   if !haveName || !haveVer {
     cmdErr(PkErrStr(PK_ERR_MANIFEST));
+    mf.MfFree(); dispose mf;
+    return 1;
+  }
+
+  if !cmdCheckUnits(dir, mf) {
     mf.MfFree(); dispose mf;
     return 1;
   }

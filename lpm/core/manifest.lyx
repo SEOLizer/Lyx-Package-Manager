@@ -20,8 +20,10 @@ con MF_SEC_PKG:     int64 := 1;
 con MF_SEC_DEPS:    int64 := 2;
 con MF_SEC_DEVDEPS: int64 := 3;
 con MF_SEC_BUILD:   int64 := 4;
+con MF_SEC_UNITS:   int64 := 5;
 
 pub con MF_MAX_DEPS: int64 := 64;
+pub con MF_MAX_UNITS: int64 := 32;
 con MF_BUF_SZ:       int64 := 8192;
 con MF_STR_MAX:      int64 := 512;
 
@@ -132,6 +134,7 @@ fn mfSecOf(sbuf: int64): int64 {
   if StrCmp(sp, "dependencies"c)     == 0 { return MF_SEC_DEPS; }
   if StrCmp(sp, "dev-dependencies"c) == 0 { return MF_SEC_DEVDEPS; }
   if StrCmp(sp, "build"c)            == 0 { return MF_SEC_BUILD; }
+  if StrCmp(sp, "build.units"c)      == 0 { return MF_SEC_UNITS; }
   return MF_SEC_NONE;
 }
 
@@ -155,6 +158,14 @@ pub type Manifest = class {
   mDevVers:  int64;
   mDevCount: int64;
 
+  // [build.units]: Zusatz-Units, die im selben Paket liegen und trotzdem
+  // einzeln importierbar sein sollen. Schluessel ist das Namenssegment hinter
+  // dem Paketnamen ("Types" fuer import Vega.Types in Paket Vega), Wert die
+  // Datei im Paketverzeichnis.
+  mUnitNames: int64;  // pchar[MF_MAX_UNITS]
+  mUnitFiles: int64;  // pchar[MF_MAX_UNITS]
+  mUnitCount: int64;
+
   pub fn MfInit(): void {
     self.mName    := 0 as pchar;
     self.mVersion := 0 as pchar;
@@ -168,6 +179,9 @@ pub type Manifest = class {
     self.mDevNames := alloc(MF_MAX_DEPS * 8);
     self.mDevVers  := alloc(MF_MAX_DEPS * 8);
     self.mDevCount := 0;
+    self.mUnitNames := alloc(MF_MAX_UNITS * 8);
+    self.mUnitFiles := alloc(MF_MAX_UNITS * 8);
+    self.mUnitCount := 0;
   }
 
   fn mfFreeS(s: pchar): void {
@@ -197,6 +211,14 @@ pub type Manifest = class {
     }
     free(self.mDevNames, MF_MAX_DEPS * 8);
     free(self.mDevVers,  MF_MAX_DEPS * 8);
+    i := 0;
+    while i < self.mUnitCount {
+      self.mfFreeS(peek64(self.mUnitNames + i * 8) as pchar);
+      self.mfFreeS(peek64(self.mUnitFiles + i * 8) as pchar);
+      i := i + 1;
+    }
+    free(self.mUnitNames, MF_MAX_UNITS * 8);
+    free(self.mUnitFiles, MF_MAX_UNITS * 8);
   }
 
   pub fn MfAddDep(name: pchar, ver: pchar): void {
@@ -212,6 +234,47 @@ pub type Manifest = class {
   pub fn MfVersion(): pchar { return self.mVersion; }
   pub fn MfEntry():   pchar { return self.mEntry; }
   pub fn MfDesc():    pchar { return self.mDesc; }
+
+  // --- [build.units] ---
+
+  pub fn MfAddUnit(name: pchar, file: pchar): void {
+    if self.mUnitCount >= MF_MAX_UNITS { return; }
+    if name == 0 as pchar { return; }
+    if file == 0 as pchar { return; }
+    poke64(self.mUnitNames + self.mUnitCount * 8, mfDup(name as int64, StrLen(name)) as int64);
+    poke64(self.mUnitFiles + self.mUnitCount * 8, mfDup(file as int64, StrLen(file)) as int64);
+    self.mUnitCount := self.mUnitCount + 1;
+  }
+
+  pub fn MfUnitCount(): int64 { return self.mUnitCount; }
+
+  pub fn MfUnitName(i: int64): pchar {
+    if i < 0 { return 0 as pchar; }
+    if i >= self.mUnitCount { return 0 as pchar; }
+    return peek64(self.mUnitNames + i * 8) as pchar;
+  }
+
+  pub fn MfUnitFile(i: int64): pchar {
+    if i < 0 { return 0 as pchar; }
+    if i >= self.mUnitCount { return 0 as pchar; }
+    return peek64(self.mUnitFiles + i * 8) as pchar;
+  }
+
+  // Datei zu einem Unit-Namen, oder 0. Gross-/Kleinschreibung zaehlt: der
+  // Schluessel ist ein Namenssegment aus dem Import und wird genau so
+  // geschrieben, wie er importiert wird.
+  pub fn MfFindUnit(name: pchar): pchar {
+    if name == 0 as pchar { return 0 as pchar; }
+    var i: int64 := 0;
+    while i < self.mUnitCount {
+      var un: pchar := peek64(self.mUnitNames + i * 8) as pchar;
+      if un != 0 as pchar {
+        if StrCmp(un, name) == 0 { return peek64(self.mUnitFiles + i * 8) as pchar; }
+      }
+      i := i + 1;
+    }
+    return 0 as pchar;
+  }
 
   // Serialisiert [dependencies] als JSON-Objekt, z.B. {"std/io":">=1.0.0"}.
   //
@@ -358,6 +421,7 @@ pub type Manifest = class {
     if sec == MF_SEC_BUILD  { self.mfApplyBuild(kbuf, vbuf, vlen); }
     if sec == MF_SEC_DEPS   { self.MfAddDep(kbuf as pchar, vbuf as pchar); }
     if sec == MF_SEC_DEVDEPS { self.MfAddDevDep(kbuf as pchar, vbuf as pchar); }
+    if sec == MF_SEC_UNITS  { self.MfAddUnit(kbuf as pchar, vbuf as pchar); }
     free(kbuf, MF_STR_MAX);
     free(vbuf, MF_STR_MAX);
   }
@@ -459,6 +523,21 @@ pub type Manifest = class {
     if self.mEntry != 0 as pchar {
       pos := mfWrS(buf, pos, "[build]\n"c);
       pos := mfWrKV(buf, pos, "entry"c, self.mEntry);
+    }
+
+    if self.mUnitCount > 0 {
+      pos := mfWrS(buf, pos, "\n[build.units]\n"c);
+      var i: int64 := 0;
+      while i < self.mUnitCount {
+        var un: pchar := peek64(self.mUnitNames + i * 8) as pchar;
+        var uf: pchar := peek64(self.mUnitFiles + i * 8) as pchar;
+        pos := mfWrS(buf, pos, "\""c);
+        pos := mfWrS(buf, pos, un);
+        pos := mfWrS(buf, pos, "\" = \""c);
+        pos := mfWrS(buf, pos, uf);
+        pos := mfWrS(buf, pos, "\"\n"c);
+        i := i + 1;
+      }
     }
 
     // O_WRONLY=1|O_CREAT=64|O_TRUNC=512=577, mode 0644=420

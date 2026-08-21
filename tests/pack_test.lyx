@@ -461,6 +461,45 @@ fn testDepsJson(): void {
 }
 
 // ---------------------------------------------------------------------------
+// [build.units] — mehrere Units in einem Paket
+// ---------------------------------------------------------------------------
+
+fn testBuildUnits(): void {
+  outLn("[build.units]"c);
+  Mkdir(TMP, 493);
+  writeFile("tests-tmp/units.toml"c,
+            "[package]\nname = \"Vega\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"vega.lyx\"\n\n[build.units]\nTypes = \"types.lyx\"\n\"Core\" = \"core.lyx\"\n"c);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  ok("gelesen"c, mf.MfRead("tests-tmp/units.toml"c));
+  okInt("zwei Units"c, mf.MfUnitCount(), 2);
+  okStr("entry bleibt daneben"c, mf.MfEntry(), "vega.lyx"c);
+  okStr("Types"c, mf.MfFindUnit("Types"c), "types.lyx"c);
+  okStr("Core, gequotet geschrieben"c, mf.MfFindUnit("Core"c), "core.lyx"c);
+  // Der Schluessel ist ein Namenssegment aus dem Import — er wird genau so
+  // geschrieben, wie importiert wird.
+  ok("Gross-/Kleinschreibung zaehlt"c, mf.MfFindUnit("types"c) == 0 as pchar);
+  ok("Unbekanntes bleibt unbekannt"c, mf.MfFindUnit("Nix"c) == 0 as pchar);
+
+  // Schreiben und wieder lesen: lpm init und lpm install schreiben das
+  // Manifest neu, dabei darf die Tabelle nicht verlorengehen.
+  ok("geschrieben"c, mf.MfWrite("tests-tmp/units2.toml"c));
+  var mf2: Manifest := new Manifest();
+  mf2.MfInit();
+  ok("wieder gelesen"c, mf2.MfRead("tests-tmp/units2.toml"c));
+  okInt("immer noch zwei"c, mf2.MfUnitCount(), 2);
+  okStr("Types ueberlebt"c, mf2.MfFindUnit("Types"c), "types.lyx"c);
+  okStr("Core ueberlebt"c, mf2.MfFindUnit("Core"c), "core.lyx"c);
+
+  mf2.MfFree(); dispose mf2;
+  mf.MfFree(); dispose mf;
+
+  DeleteFile("tests-tmp/units.toml"c);
+  DeleteFile("tests-tmp/units2.toml"c);
+}
+
+// ---------------------------------------------------------------------------
 
 pub fn main(argc: int64, argv: pchar): int64 {
   outLn("pack tests"c);
@@ -481,6 +520,7 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testUndeclaredImports();
   testNoUndeclared();
   testDepsJson();
+  testBuildUnits();
 
   cleanup();
   ok("tests-tmp/ wieder aufgeraeumt"c, !IsDirectory(TMP));

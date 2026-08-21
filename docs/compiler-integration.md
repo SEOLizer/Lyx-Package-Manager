@@ -6,7 +6,7 @@ an `lyxc` sind hier nicht umgesetzt** — sie gehören ins Compiler-Repository u
 liegen beim Compiler-Team. Was hier steht, ist die Schnittstelle von `lpm` aus
 gesehen, samt der Fundstellen, die eine Umsetzung betreffen würde.
 
-Stand: 2026-08-16, `lpm` 0.1.0, `lyxc` 1.0.20F.
+Stand: 2026-08-21, `lpm` 0.1.2, `lyxc` 1.1.5A.
 
 ---
 
@@ -74,6 +74,23 @@ nebeneinander liegen. `--entry` löst das auf der `lpm`-Seite auf: gesucht wird
 zuerst `[build] entry` aus der `lyx.toml` des Pakets, dann
 `<letztes Namenssegment>.lyx`, dann dasselbe mit `.lyu`. Der Compiler muss das
 Paketlayout damit nicht kennen.
+
+Trägt ein Paket mehrere einzeln importierbare Units, stehen die zusätzlichen
+in `[build.units]` seiner `lyx.toml`:
+
+```toml
+[build]
+entry = "vega.lyx"
+
+[build.units]
+types = "types.lyx"
+```
+
+`lpm resolve vega.types --entry` sucht dann zuerst ein Paket `vega/types` und
+fällt, wenn es keins gibt, auf das Elternpaket `vega` samt dessen
+`[build.units]` zurück — ein eigenständiges Paket hat immer Vorrang. Für den
+Compiler ändert sich dabei nichts: er übergibt den Importnamen unverändert und
+bekommt einen Dateipfad.
 
 ### Weitere Eigenschaften
 

@@ -197,7 +197,7 @@ fn lpaZstdToTar(srcPath: pchar, tarPath: int64): int64 {
 // Entpackt alle regulaeren Dateien aus tarPath nach destDir.
 // Gibt die Anzahl geschriebener Dateien zurueck, oder einen LPA_ERR_*-Code.
 fn lpaTarExtract(tarPath: int64, destDir: pchar): int64 {
-  var h: int64 := TarOpen(tarPath);
+  var h: int64 := TarOpen(tarPath as pchar);
   if h == 0 { return LPA_ERR_TAR; }
 
   var count: int64 := TarCount(h);
