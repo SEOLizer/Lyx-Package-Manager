@@ -22,7 +22,7 @@ all: bin/lpm
 
 bin/lpm: $(SRCS)
 	mkdir -p bin
-	$(LYXC) main.lyx -I $(ROOT) -I $(AURUM) -o bin/lpm
+	$(LYXC) main.lyx --std-path=$(AURUM) -I $(ROOT) -I $(AURUM) -o bin/lpm
 
 clean:
 	rm -f bin/lpm
@@ -56,22 +56,22 @@ test: bin/resolver_test bin/index_test bin/fetch_test bin/pack_test bin/credenti
 
 bin/resolver_test: tests/resolver_test.lyx lpm/core/resolver.lyx lpm/core/semver.lyx lpm/core/lockfile.lyx
 	mkdir -p bin
-	$(LYXC) tests/resolver_test.lyx -I $(ROOT) -I $(AURUM) -o bin/resolver_test
+	$(LYXC) tests/resolver_test.lyx --std-path=$(AURUM) -I $(ROOT) -I $(AURUM) -o bin/resolver_test
 
 bin/index_test: tests/index_test.lyx lpm/core/index.lyx lpm/core/resolver.lyx lpm/core/semver.lyx lpm/core/lockfile.lyx
 	mkdir -p bin
-	$(LYXC) tests/index_test.lyx -I $(ROOT) -I $(AURUM) -o bin/index_test
+	$(LYXC) tests/index_test.lyx --std-path=$(AURUM) -I $(ROOT) -I $(AURUM) -o bin/index_test
 
 bin/fetch_test: tests/fetch_test.lyx lpm/core/fetch.lyx lpm/core/cache.lyx lpm/core/dirent.lyx
 	mkdir -p bin
-	$(LYXC) tests/fetch_test.lyx -I $(ROOT) -I $(AURUM) -o bin/fetch_test
+	$(LYXC) tests/fetch_test.lyx --std-path=$(AURUM) -I $(ROOT) -I $(AURUM) -o bin/fetch_test
 
 bin/pack_test: tests/pack_test.lyx lpm/core/pack.lyx lpm/core/archive.lyx lpm/core/dirent.lyx lpm/core/manifest.lyx
 	mkdir -p bin
-	$(LYXC) tests/pack_test.lyx -I $(ROOT) -I $(AURUM) -o bin/pack_test
+	$(LYXC) tests/pack_test.lyx --std-path=$(AURUM) -I $(ROOT) -I $(AURUM) -o bin/pack_test
 
 bin/credentials_test: tests/credentials_test.lyx lpm/core/credentials.lyx lpm/core/cache.lyx lpm/core/dirent.lyx
 	mkdir -p bin
-	$(LYXC) tests/credentials_test.lyx -I $(ROOT) -I $(AURUM) -o bin/credentials_test
+	$(LYXC) tests/credentials_test.lyx --std-path=$(AURUM) -I $(ROOT) -I $(AURUM) -o bin/credentials_test
 
 .PHONY: test
