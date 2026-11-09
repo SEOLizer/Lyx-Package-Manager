@@ -1,7 +1,7 @@
 # lpm — Handbuch
 
 Vom leeren Verzeichnis bis zum veröffentlichten Paket. Alle Beispiele sind
-gegen `lpm 0.1.3` und `https://lpm.seolizer.de` ausgeführt.
+gegen `lpm 0.1.4` und `https://lpm.seolizer.de` ausgeführt.
 
 Die Serverseite (Registry einrichten, vhost, Token-Datei) steht in
 [`../deploy/README.md`](../deploy/README.md).
@@ -40,7 +40,7 @@ Prüfen:
 
 ```console
 $ lpm --version
-lpm 0.1.3
+lpm 0.1.4
 ```
 
 Systemweit ginge `sudo make install` (nach `/usr/local/bin`), entfernen mit
@@ -300,6 +300,55 @@ Was dabei zu wissen ist:
   Registry-Index. Sie wird beim Auflösen aus dem entpackten Paket gelesen —
   an der Registry ändert sich nichts.
 
+### Importnamen vom Paketnamen trennen: `[build.provides]`
+
+Ein Paket muss nicht so heißen wie der Import, den es bedient. `[build.provides]`
+hält fest, welche Importnamen aus welchem Verzeichnis kommen:
+
+```toml
+[package]
+name = "lyx-std-dev"
+
+[build]
+entry = "std/io.lyx"
+
+[build.provides]
+std  = "std"      # import std.fs            -> <paket>/std/fs.lyx
+data = "data"     # import std.cloud.gcp.jwt -> <paket>/std/cloud/gcp/jwt.lyx
+```
+
+Der Schlüssel ist das **erste Segment** des Importnamens, der Wert das
+Verzeichnis im Paket. Die restlichen Segmente werden zum Pfad darunter, also
+auch mehrstufige Namen — `[build.units]` braucht dafür keinen Eintrag mehr.
+Weil der Wert ein Verzeichnis ist, darf ein Paket seine Dateien anders anordnen
+als sein Importname lautet (`vega = "src/vega"`).
+
+**Gesucht wird im lokalen Cache.** `lpm resolve` liest
+`~/.lpm/cache/<paket>/<version>/lyx.toml` und prüft dort `[build.provides]`.
+Kein Serverumbau, und `--offline` ändert am Ergebnis nichts. Die Grenze gehört
+dazu: **ein Paket, das noch nicht im Cache liegt, wird so nicht gefunden** —
+`lpm install <paket>` muss einmal gelaufen sein. Der Registry-Index trägt die
+bedienten Namen (noch) nicht.
+
+**Vorrang**, in dieser Reihenfolge:
+
+1. Ein Paket, dessen **Name** dem Importnamen entspricht. Alles Bestehende
+   bleibt damit gültig.
+2. `[build.units]` des zutreffenden Pakets.
+3. `[build.provides]` eines gecachten Pakets.
+
+Erst wenn im Cache nichts davon passt, wird die Registry gefragt. Bedienen
+**zwei** gecachte Pakete denselben Importnamen, ist das ein Fehler mit beiden
+Namen in der Meldung und nicht die Wahl des ersten Funds:
+
+```console
+$ lpm resolve std.fs --entry
+lpm: error: Importname "std" wird von mehreren gecachten Paketen bedient:
+     andere-std@0.0.1 ([build.provides] std = "std")
+     lyx-std-dev@0.1.0 ([build.provides] std = "std")
+     Eines der beiden Pakete aus dem Cache entfernen: lpm cache remove <name>
+```
+
 Ein Schlüssel darf selbst mehrstufig sein — dann wird er in der `lyx.toml`
 gequotet, weil TOML den Punkt sonst als Tabellentrenner liest:
 
@@ -326,6 +375,8 @@ Gemessen an der Lyx-Standardbibliothek (`std`: 500 Units, 503 Dateien) gelten:
 | entpackte Gesamtgröße | 64 MiB | `PK_TOTAL_MAX`, `LPA_TAR_MAX` |
 | Verzeichnisebenen | 8 | `PK_DEPTH_MAX` |
 | Einträge in `[build.units]` | 4096 | `MF_MAX_UNITS` |
+| Einträge in `[build.provides]` | 64 | `MF_MAX_PROV` |
+| Größe einer `lyx.toml` | 4 MiB | `MF_FILE_MAX` |
 
 Jede Grenze ist laut: `lpm pack` bricht mit `PK_ERR_LIMIT` ab, ein zu tiefes
 Verzeichnis ebenfalls, und ein `[build.units]` über der Grenze mit der Meldung,

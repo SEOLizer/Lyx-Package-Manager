@@ -739,6 +739,124 @@ fn testUnitLimit(): void {
 }
 
 // ---------------------------------------------------------------------------
+// [build.provides] (Issue #6)
+// ---------------------------------------------------------------------------
+//
+// Geprueft wird die Manifestseite: lesen, nachschlagen, schreiben, wieder
+// lesen. Dass `lpm resolve` daraus den Pfad baut und bei zwei Paketen mit
+// demselben Eintrag abbricht, ist CLI-Verhalten und steht im Handbuch.
+
+fn testProvides(): void {
+  outLn("[build.provides] (Issue #6)"c);
+
+  Mkdir(TMP, 493);
+  writeFile("tests-tmp/prov.toml"c,
+            "[package]\nname = \"lyx-std-dev\"\nversion = \"0.1.0\"\n\n[build]\nentry = \"std/io.lyx\"\n\n[build.provides]\nstd = \"std\"\ndata = \"data\"\n"c);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  ok("gelesen"c, mf.MfRead("tests-tmp/prov.toml"c));
+  okStr("Paket heisst weiter lyx-std-dev"c, mf.MfName(), "lyx-std-dev"c);
+  okInt("zwei Importnamen"c, mf.MfProvCount(), 2);
+  okStr("std -> std"c,   mf.MfFindProvide("std"c),  "std"c);
+  okStr("data -> data"c, mf.MfFindProvide("data"c), "data"c);
+  ok("nichts erfunden"c, mf.MfFindProvide("vega"c) == 0 as pchar);
+  okInt("nichts verloren"c, mf.MfProvLost(), 0);
+
+  // Der Abschnitt muss das Schreiben ueberleben: lpm init und lpm install
+  // schreiben das Manifest neu.
+  ok("geschrieben"c, mf.MfWrite("tests-tmp/prov2.toml"c));
+  var mf2: Manifest := new Manifest();
+  mf2.MfInit();
+  ok("wieder gelesen"c, mf2.MfRead("tests-tmp/prov2.toml"c));
+  okInt("immer noch zwei"c, mf2.MfProvCount(), 2);
+  okStr("std ueberlebt"c, mf2.MfFindProvide("std"c), "std"c);
+  okStr("entry bleibt daneben"c, mf2.MfEntry(), "std/io.lyx"c);
+
+  mf2.MfFree(); dispose mf2;
+  mf.MfFree(); dispose mf;
+
+  // Ueberlauf: MF_MAX_PROV ist die Grenze, und sie wird gemeldet.
+  var mf3: Manifest := new Manifest();
+  mf3.MfInit();
+  var name: int64 := alloc(PK_T_PATH);
+  var i: int64 := 0;
+  while i < MF_MAX_PROV {
+    limitPath(name, "p"c, i);
+    mf3.MfAddProvide(name as pchar, "dir"c);
+    i := i + 1;
+  }
+  okInt("voll bei MF_MAX_PROV"c, mf3.MfProvCount(), MF_MAX_PROV);
+  ok("einer darueber wird abgewiesen"c, !mf3.MfAddProvide("nochwas"c, "dir"c));
+  okInt("und gezaehlt"c, mf3.MfProvLost(), 1);
+  free(name, PK_T_PATH);
+  mf3.MfFree(); dispose mf3;
+
+  DeleteFile("tests-tmp/prov.toml"c);
+  DeleteFile("tests-tmp/prov2.toml"c);
+}
+
+// ---------------------------------------------------------------------------
+// Grosses Manifest: lesen und schreiben ohne Verlust
+// ---------------------------------------------------------------------------
+//
+// MF_BUF_SZ waren 8 KiB, fest, fuer BEIDE Richtungen. Mit 4096 moeglichen
+// Units hiess das: ein Manifest mit einigen hundert Eintraegen wurde beim
+// Lesen abgeschnitten (und galt als vollstaendig), beim Schreiben lief es
+// hinter den Puffer. Beides faellt hier auf.
+
+fn testBigManifest(): void {
+  outLn("grosses Manifest (ueber 8 KiB)"c);
+
+  Mkdir(TMP, 493);
+  // Name und Version kommen aus einer gelesenen Datei — Setter gibt es nicht.
+  writeFile("tests-tmp/gross-kopf.toml"c,
+            "[package]\nname = \"demo/gross\"\nversion = \"1.0.0\"\n"c);
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  ok("Kopf gelesen"c, mf.MfRead("tests-tmp/gross-kopf.toml"c));
+
+  // 500 Units wie in der Standardbibliothek: je Zeile rund 40 Byte, also
+  // etwa 20 KiB — mehr als das Doppelte des alten Puffers.
+  var name: int64 := alloc(PK_T_PATH);
+  var file: int64 := alloc(PK_T_PATH);
+  var i: int64 := 0;
+  while i < 500 {
+    limitPath(name, "u"c, i);
+    limitPath(file, "src"c, i);
+    mf.MfAddUnit(name as pchar, file as pchar);
+    i := i + 1;
+  }
+  okInt("500 Units im Speicher"c, mf.MfUnitCount(), 500);
+  ok("geschrieben"c, mf.MfWrite("tests-tmp/gross.toml"c));
+  ok("Datei ist groesser als der alte Puffer"c,
+     FileSize("tests-tmp/gross.toml"c) > 8192);
+
+  var mf2: Manifest := new Manifest();
+  mf2.MfInit();
+  ok("wieder gelesen"c, mf2.MfRead("tests-tmp/gross.toml"c));
+  okStr("Name ueberlebt"c, mf2.MfName(), "demo/gross"c);
+  okInt("alle 500 kamen zurueck"c, mf2.MfUnitCount(), 500);
+  okInt("nichts verloren"c, mf2.MfUnitsLost(), 0);
+
+  // Stichproben am Anfang, in der Mitte und am Ende — ein abgeschnittenes
+  // Manifest verliert genau das Ende.
+  limitPath(name, "u"c, 1);   limitPath(file, "src"c, 1);
+  okStr("erster Eintrag"c, mf2.MfFindUnit(name as pchar), file as pchar);
+  limitPath(name, "u"c, 250); limitPath(file, "src"c, 250);
+  okStr("mittlerer Eintrag"c, mf2.MfFindUnit(name as pchar), file as pchar);
+  limitPath(name, "u"c, 499); limitPath(file, "src"c, 499);
+  okStr("letzter Eintrag"c, mf2.MfFindUnit(name as pchar), file as pchar);
+
+  free(file, PK_T_PATH);
+  free(name, PK_T_PATH);
+  mf2.MfFree(); dispose mf2;
+  mf.MfFree(); dispose mf;
+  DeleteFile("tests-tmp/gross.toml"c);
+  DeleteFile("tests-tmp/gross-kopf.toml"c);
+}
+
+// ---------------------------------------------------------------------------
 
 pub fn main(argc: int64, argv: pchar): int64 {
   outLn("pack tests"c);
@@ -764,6 +882,8 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testDepth();
   testUnitLimit();
   testDottedUnitKey();
+  testProvides();
+  testBigManifest();
 
   cleanup();
   ok("tests-tmp/ wieder aufgeraeumt"c, !IsDirectory(TMP));

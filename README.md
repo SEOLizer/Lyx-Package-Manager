@@ -6,7 +6,7 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 
 `lpm` ist selbst vollständig in Lyx geschrieben und wird mit `lyxc` übersetzt.
 
-> **Status: frühe Entwicklung (v0.1.3).** Der Install-Flow läuft end-to-end gegen
+> **Status: frühe Entwicklung (v0.1.4).** Der Install-Flow läuft end-to-end gegen
 > die öffentliche Registry: leerer Cache → Index per HTTPS → Auflösung → Archiv
 > per HTTPS → SHA256-Prüfung → entpackt im Cache. Funktionsfähig sind `init`,
 > `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list`,
@@ -186,6 +186,14 @@ json = "json.lyx"
 ```
 
 Unterstützte SemVer-Ranges: `^`, `~`, `>=`, `=`.
+`[build.provides]` ist optional und trennt den Paketnamen von der
+Importauflösung: der Schlüssel ist das erste Segment eines Importnamens, der
+Wert das Verzeichnis im Paket (`std = "std"`). Damit bedient ein Paket
+`lyx-std-dev` den Import `std.cloud.gcp.jwt` aus `std/cloud/gcp/jwt.lyx`.
+Gesucht wird in den gecachten Paketen, das Paket muss also einmal installiert
+sein. Vorrang hat ein Paket gleichen Namens, dann `[build.units]`, dann
+`[build.provides]`; zwei Pakete mit demselben Eintrag sind ein Fehler.
+
 `[build.units]` ist optional und nennt weitere Units desselben Pakets, die
 einzeln importierbar sein sollen: der Schlüssel ist das Namenssegment hinter
 dem Paketnamen (`import net.http.json`), der Wert die Datei im

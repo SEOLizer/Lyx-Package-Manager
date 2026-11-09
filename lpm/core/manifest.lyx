@@ -21,12 +21,22 @@ con MF_SEC_DEPS:    int64 := 2;
 con MF_SEC_DEVDEPS: int64 := 3;
 con MF_SEC_BUILD:   int64 := 4;
 con MF_SEC_UNITS:   int64 := 5;
+// [build.provides] (Issue #6): welche IMPORTNAMEN dieses Paket bedient, und in
+// welchem Verzeichnis sie liegen. Trennt den Paketnamen von der
+// Importaufloesung -- bis dahin musste ein Paket "std" heissen, um `import
+// std.fs` zu bedienen.
+con MF_SEC_PROV:    int64 := 6;
 
 pub con MF_MAX_DEPS: int64 := 64;
 // [build.units] je Paket. 32 waren fuer die Standardbibliothek viel zu wenig
 // (std: 500 Units, 468 still verlorene Eintraege — Issue #3).
 pub con MF_MAX_UNITS: int64 := 4096;
-con MF_BUF_SZ:       int64 := 8192;
+// [build.provides] je Paket. Ein Paket bedient ueblicherweise einen oder zwei
+// Importnamen (die Standardbibliothek: "std" und "data"); 64 ist reichlich und
+// der Ueberlauf wird gemeldet, nicht verschwiegen.
+pub con MF_MAX_PROV: int64 := 64;
+con MF_BUF_SZ:       int64 := 8192;        // Mindestgroesse des Lesepuffers
+con MF_FILE_MAX:     int64 := 4194304;     // 4 MiB — darueber ist es kein Manifest
 con MF_STR_MAX:      int64 := 512;
 
 // ---------------------------------------------------------------------------
@@ -137,6 +147,7 @@ fn mfSecOf(sbuf: int64): int64 {
   if StrCmp(sp, "dev-dependencies"c) == 0 { return MF_SEC_DEVDEPS; }
   if StrCmp(sp, "build"c)            == 0 { return MF_SEC_BUILD; }
   if StrCmp(sp, "build.units"c)      == 0 { return MF_SEC_UNITS; }
+  if StrCmp(sp, "build.provides"c)   == 0 { return MF_SEC_PROV; }
   return MF_SEC_NONE;
 }
 
@@ -169,6 +180,20 @@ pub type Manifest = class {
   mUnitCount: int64;
   mUnitsLost: int64;   // verworfene [build.units]-Eintraege (Issue #3)
 
+  // [build.provides]: Importname -> Verzeichnis im Paket (Issue #6).
+  //
+  //   [build.provides]
+  //   std  = "std"       # import std.fs            -> <paket>/std/fs.lyx
+  //   data = "data"      # import std.cloud.gcp.jwt -> <paket>/std/cloud/gcp/jwt.lyx
+  //
+  // Der Schluessel ist das ERSTE Segment des Importnamens, der Wert das
+  // Verzeichnis. Damit ist die Aufloesung pfadbasiert und erfasst auch
+  // mehrstufige Namen, die [build.units] nicht erreicht (Issue #5).
+  mProvNames: int64;  // pchar[MF_MAX_PROV]
+  mProvDirs:  int64;  // pchar[MF_MAX_PROV]
+  mProvCount: int64;
+  mProvLost:  int64;
+
   pub fn MfInit(): void {
     self.mName    := 0 as pchar;
     self.mVersion := 0 as pchar;
@@ -186,6 +211,10 @@ pub type Manifest = class {
     self.mUnitFiles := alloc(MF_MAX_UNITS * 8);
     self.mUnitCount := 0;
     self.mUnitsLost := 0;
+    self.mProvNames := alloc(MF_MAX_PROV * 8);
+    self.mProvDirs  := alloc(MF_MAX_PROV * 8);
+    self.mProvCount := 0;
+    self.mProvLost  := 0;
   }
 
   fn mfFreeS(s: pchar): void {
@@ -223,6 +252,14 @@ pub type Manifest = class {
     }
     free(self.mUnitNames, MF_MAX_UNITS * 8);
     free(self.mUnitFiles, MF_MAX_UNITS * 8);
+    i := 0;
+    while i < self.mProvCount {
+      self.mfFreeS(peek64(self.mProvNames + i * 8) as pchar);
+      self.mfFreeS(peek64(self.mProvDirs  + i * 8) as pchar);
+      i := i + 1;
+    }
+    free(self.mProvNames, MF_MAX_PROV * 8);
+    free(self.mProvDirs,  MF_MAX_PROV * 8);
   }
 
   pub fn MfAddDep(name: pchar, ver: pchar): void {
@@ -286,6 +323,55 @@ pub type Manifest = class {
       var un: pchar := peek64(self.mUnitNames + i * 8) as pchar;
       if un != 0 as pchar {
         if StrCmp(un, name) == 0 { return peek64(self.mUnitFiles + i * 8) as pchar; }
+      }
+      i := i + 1;
+    }
+    return 0 as pchar;
+  }
+
+  // --- [build.provides] (Issue #6) ---
+
+  pub fn MfAddProvide(name: pchar, dir: pchar): bool {
+    if self.mProvCount >= MF_MAX_PROV {
+      // Nicht verschweigen: ein verlorener Eintrag heisst, dass ein Import
+      // sein Paket nicht findet, und das sieht beim Benutzer wie ein
+      // Tippfehler im Importnamen aus.
+      self.mProvLost := self.mProvLost + 1;
+      return false;
+    }
+    if name == 0 as pchar { return false; }
+    if dir  == 0 as pchar { return false; }
+    poke64(self.mProvNames + self.mProvCount * 8, mfDup(name as int64, StrLen(name)) as int64);
+    poke64(self.mProvDirs  + self.mProvCount * 8, mfDup(dir  as int64, StrLen(dir))  as int64);
+    self.mProvCount := self.mProvCount + 1;
+    return true;
+  }
+
+  pub fn MfProvCount(): int64 { return self.mProvCount; }
+  pub fn MfProvLost():  int64 { return self.mProvLost;  }
+
+  pub fn MfProvName(i: int64): pchar {
+    if i < 0 { return 0 as pchar; }
+    if i >= self.mProvCount { return 0 as pchar; }
+    return peek64(self.mProvNames + i * 8) as pchar;
+  }
+
+  pub fn MfProvDir(i: int64): pchar {
+    if i < 0 { return 0 as pchar; }
+    if i >= self.mProvCount { return 0 as pchar; }
+    return peek64(self.mProvDirs + i * 8) as pchar;
+  }
+
+  // Verzeichnis zu einem Importnamen, oder 0. Gross-/Kleinschreibung zaehlt,
+  // wie bei MfFindUnit: der Schluessel ist ein Segment aus dem Import und wird
+  // genau so geschrieben, wie er importiert wird.
+  pub fn MfFindProvide(name: pchar): pchar {
+    if name == 0 as pchar { return 0 as pchar; }
+    var i: int64 := 0;
+    while i < self.mProvCount {
+      var pn: pchar := peek64(self.mProvNames + i * 8) as pchar;
+      if pn != 0 as pchar {
+        if StrCmp(pn, name) == 0 { return peek64(self.mProvDirs + i * 8) as pchar; }
       }
       i := i + 1;
     }
@@ -438,15 +524,25 @@ pub type Manifest = class {
     if sec == MF_SEC_DEPS   { self.MfAddDep(kbuf as pchar, vbuf as pchar); }
     if sec == MF_SEC_DEVDEPS { self.MfAddDevDep(kbuf as pchar, vbuf as pchar); }
     if sec == MF_SEC_UNITS  { self.MfAddUnit(kbuf as pchar, vbuf as pchar); }
+    if sec == MF_SEC_PROV   { self.MfAddProvide(kbuf as pchar, vbuf as pchar); }
     free(kbuf, MF_STR_MAX);
     free(vbuf, MF_STR_MAX);
   }
 
   // Read and parse lyx.toml at path. Returns true on success.
+  // Der Lesepuffer richtet sich nach der Datei. Fest 8 KiB waren zu klein,
+  // seit ein Manifest 4096 Units fassen darf: die lyx.toml der
+  // Standardbibliothek ist mit 500 Eintraegen etwa 20 KiB, und ein
+  // abgeschnittenes Manifest wird als vollstaendiges gelesen — derselbe stille
+  // Verlust wie beim Ueberlauf von MfAddUnit (Issue #3).
   pub fn MfRead(path: pchar): bool {
-    var buf: int64 := alloc(MF_BUF_SZ + 1);
-    var nread: int64 := ReadFile(path, buf as pchar, MF_BUF_SZ);
-    if nread <= 0 { free(buf, MF_BUF_SZ + 1); return false; }
+    var cap: int64 := FileSize(path);
+    if cap > MF_FILE_MAX { return false; }
+    if cap < MF_BUF_SZ { cap := MF_BUF_SZ; }
+
+    var buf: int64 := alloc(cap + 1);
+    var nread: int64 := ReadFile(path, buf as pchar, cap);
+    if nread <= 0 { free(buf, cap + 1); return false; }
     poke8(buf + nread, 0);
 
     var sec: int64 := MF_SEC_NONE;
@@ -487,13 +583,56 @@ pub type Manifest = class {
     }
 
     free(sbuf, MF_STR_MAX);
-    free(buf, MF_BUF_SZ + 1);
+    free(buf, cap + 1);
     return true;
   }
 
   // Write manifest to path as lyx.toml. Returns true on success.
+  // Wieviel Platz braucht das geschriebene Manifest? Eine feste Groesse war
+  // hier falsch: MF_BUF_SZ (8 KiB) fasst die 4096 moeglichen [build.units]
+  // nicht, und mfWrS prueft keine Grenze — das waere ein Schreiben hinter den
+  // Puffer gewesen, sobald ein Paket mehr als etwa 200 Units fuehrt.
+  fn mfWriteNeed(): int64 {
+    var n: int64 := 512;   // Kopf, Abschnittsnamen, Leerzeilen
+    n := n + self.mfSLen(self.mName) + self.mfSLen(self.mVersion);
+    n := n + self.mfSLen(self.mAuthor) + self.mfSLen(self.mLicense);
+    n := n + self.mfSLen(self.mDesc) + self.mfSLen(self.mEntry);
+
+    var i: int64 := 0;
+    while i < self.mDepCount {
+      n := n + self.mfSLen(peek64(self.mDepNames + i * 8) as pchar);
+      n := n + self.mfSLen(peek64(self.mDepVers  + i * 8) as pchar) + 16;
+      i := i + 1;
+    }
+    i := 0;
+    while i < self.mDevCount {
+      n := n + self.mfSLen(peek64(self.mDevNames + i * 8) as pchar);
+      n := n + self.mfSLen(peek64(self.mDevVers  + i * 8) as pchar) + 16;
+      i := i + 1;
+    }
+    i := 0;
+    while i < self.mUnitCount {
+      n := n + self.mfSLen(peek64(self.mUnitNames + i * 8) as pchar);
+      n := n + self.mfSLen(peek64(self.mUnitFiles + i * 8) as pchar) + 16;
+      i := i + 1;
+    }
+    i := 0;
+    while i < self.mProvCount {
+      n := n + self.mfSLen(peek64(self.mProvNames + i * 8) as pchar);
+      n := n + self.mfSLen(peek64(self.mProvDirs  + i * 8) as pchar) + 16;
+      i := i + 1;
+    }
+    return n;
+  }
+
+  fn mfSLen(s: pchar): int64 {
+    if s == 0 as pchar { return 0; }
+    return StrLen(s);
+  }
+
   pub fn MfWrite(path: pchar): bool {
-    var buf: int64 := alloc(MF_BUF_SZ);
+    var cap: int64 := self.mfWriteNeed();
+    var buf: int64 := alloc(cap);
     var pos: int64 := 0;
 
     pos := mfWrS(buf, pos, "[package]\n"c);
@@ -541,6 +680,21 @@ pub type Manifest = class {
       pos := mfWrKV(buf, pos, "entry"c, self.mEntry);
     }
 
+    if self.mProvCount > 0 {
+      pos := mfWrS(buf, pos, "\n[build.provides]\n"c);
+      var i: int64 := 0;
+      while i < self.mProvCount {
+        var pn: pchar := peek64(self.mProvNames + i * 8) as pchar;
+        var pd: pchar := peek64(self.mProvDirs  + i * 8) as pchar;
+        pos := mfWrS(buf, pos, "\""c);
+        pos := mfWrS(buf, pos, pn);
+        pos := mfWrS(buf, pos, "\" = \""c);
+        pos := mfWrS(buf, pos, pd);
+        pos := mfWrS(buf, pos, "\"\n"c);
+        i := i + 1;
+      }
+    }
+
     if self.mUnitCount > 0 {
       pos := mfWrS(buf, pos, "\n[build.units]\n"c);
       var i: int64 := 0;
@@ -564,7 +718,7 @@ pub type Manifest = class {
       close(wfd);
       ok := true;
     }
-    free(buf, MF_BUF_SZ);
+    free(buf, cap);
     return ok;
   }
 }

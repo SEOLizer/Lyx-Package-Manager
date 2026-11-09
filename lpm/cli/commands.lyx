@@ -114,7 +114,7 @@ fn cmdGetHome(argc: int64, argv: pchar): pchar {
 // ---------------------------------------------------------------------------
 
 fn lpmHelp(): void {
-  cmdOutLn("lpm 0.1.3 — Lyx Package Manager"c);
+  cmdOutLn("lpm 0.1.4 — Lyx Package Manager"c);
   cmdOutLn(""c);
   cmdOutLn("Verwendung: lpm <subcommand> [optionen]"c);
   cmdOutLn(""c);
@@ -152,7 +152,7 @@ fn lpmHelp(): void {
 // ---------------------------------------------------------------------------
 
 fn lpmVersion(): void {
-  cmdOutLn("lpm 0.1.3"c);
+  cmdOutLn("lpm 0.1.4"c);
 }
 
 // ---------------------------------------------------------------------------
@@ -1751,6 +1751,274 @@ fn cmdResolveViaRegistry(ctx: LpmCtx, home: pchar, pkg: pchar, sub: pchar,
   return ok;
 }
 
+// ---------------------------------------------------------------------------
+// [build.provides]: Importname -> Paket im Cache (Issue #6)
+// ---------------------------------------------------------------------------
+//
+// Bis hierher musste ein Paket so heissen wie der Import, den es bedient: wer
+// `import std.fs` bedienen wollte, brauchte ein Paket namens `std`. Ein
+// sprechender Registry-Name wie `lyx-std-dev` und ein bedienter Importname
+// standen damit im Widerspruch.
+//
+// Gesucht wird in den GECACHTEN Paketen: ~/.lpm/cache/<name>/<version>/lyx.toml
+// lesen, dort [build.provides] pruefen, bei Treffer den Pfad bilden. Kein
+// Serverumbau, und --offline bleibt voll brauchbar. Die Grenze: ein Paket, das
+// noch nicht im Cache liegt, wird so nicht gefunden — `lpm install <paket>`
+// muss einmal gelaufen sein.
+//
+// Zwei Pakete, die denselben Importnamen bedienen, sind ein Fehler und nicht
+// die Wahl des ersten Funds. Deshalb wird der Baum vollstaendig durchlaufen
+// und erst danach entschieden.
+
+con CMD_PROV_MAX: int64 := 8;        // gemeldete Mehrdeutigkeiten
+con LPM_PROV_DEPTH: int64 := 8;      // Namensebenen im Cache, wie LPC_DEPTH_MAX
+
+con CMD_PROV_NONE:  int64 := 0;
+con CMD_PROV_HIT:   int64 := 1;
+con CMD_PROV_AMBIG: int64 := 0 - 1;
+
+// Ein Treffer: Paketname, Version und das Verzeichnis aus [build.provides].
+var cmdProvNames: int64 := 0;   // pchar[CMD_PROV_MAX]
+var cmdProvVers:  int64 := 0;
+var cmdProvDirs:  int64 := 0;
+var cmdProvCount: int64 := 0;
+
+fn cmdProvInit(): void {
+  if cmdProvNames == 0 {
+    cmdProvNames := alloc(CMD_PROV_MAX * 8);
+    cmdProvVers  := alloc(CMD_PROV_MAX * 8);
+    cmdProvDirs  := alloc(CMD_PROV_MAX * 8);
+  }
+  cmdProvCount := 0;
+}
+
+fn cmdProvFree(): void {
+  var i: int64 := 0;
+  while i < cmdProvCount {
+    var p: int64 := peek64(cmdProvNames + i * 8);
+    if p != 0 { free(p, CMD_PATH_MAX); }
+    p := peek64(cmdProvVers + i * 8);
+    if p != 0 { free(p, CMD_NAME_MAX); }
+    p := peek64(cmdProvDirs + i * 8);
+    if p != 0 { free(p, CMD_PATH_MAX); }
+    i := i + 1;
+  }
+  cmdProvCount := 0;
+}
+
+fn cmdProvAdd(name: pchar, version: pchar, dir: pchar): void {
+  if cmdProvCount >= CMD_PROV_MAX { return; }
+  var n: int64 := alloc(CMD_PATH_MAX);
+  var v: int64 := alloc(CMD_NAME_MAX);
+  var d: int64 := alloc(CMD_PATH_MAX);
+  var p: int64 := 0;
+  p := cmdWrS(n, 0, name);     poke8(n + p, 0);
+  p := cmdWrS(v, 0, version);  poke8(v + p, 0);
+  p := cmdWrS(d, 0, dir);      poke8(d + p, 0);
+  poke64(cmdProvNames + cmdProvCount * 8, n);
+  poke64(cmdProvVers  + cmdProvCount * 8, v);
+  poke64(cmdProvDirs  + cmdProvCount * 8, d);
+  cmdProvCount := cmdProvCount + 1;
+}
+
+// Liest die lyx.toml eines gecachten Pakets und merkt sich einen Treffer.
+fn cmdProvCheckPkg(home: pchar, pkgName: pchar, version: pchar,
+                   seg: pchar): void {
+  var dir: pchar := LpmCachePkgPath(home, pkgName, version);
+  var toml: int64 := alloc(CMD_PATH_MAX);
+  var p: int64 := 0;
+  p := cmdWrS(toml, p, dir);
+  p := cmdWrS(toml, p, "/lyx.toml"c);
+  poke8(toml + p, 0);
+
+  if FileExists(toml as pchar) {
+    var mf: Manifest := new Manifest();
+    mf.MfInit();
+    if mf.MfRead(toml as pchar) {
+      var pd: pchar := mf.MfFindProvide(seg);
+      if pd != 0 as pchar {
+        if peek8(pd as int64) as int64 != 0 { cmdProvAdd(pkgName, version, pd); }
+      }
+    }
+    mf.MfFree(); dispose mf;
+  }
+
+  free(toml, CMD_PATH_MAX);
+  LpmCacheFreePath(dir);
+}
+
+// Laeuft den Cache-Baum ab. relName ist der bisher aufgebaute Paketname, also
+// "net" auf dem Weg zu "net/http". Eine Ebene, deren Name mit einer Ziffer
+// beginnt, ist die Versionsebene — dort liegt das Paket.
+fn cmdProvWalk(home: pchar, dirPath: pchar, relName: int64, relLen: int64,
+               seg: pchar, depth: int64): void {
+  if depth > LPM_PROV_DEPTH { return; }
+
+  var dl: int64 := LpmDirOpen(dirPath);
+  if dl == 0 { return; }
+
+  var n: int64 := LpmDirCount(dl);
+  var i: int64 := 0;
+  while i < n {
+    if LpmDirType(dl, i) == LPD_DT_DIR {
+      var ename: pchar := LpmDirName(dl, i);
+      var elen:  int64 := LpmDirNameLen(dl, i);
+      var c0: int64 := peek8(ename as int64) as int64;
+
+      if c0 >= 48 && c0 <= 57 {
+        // Versionsebene: relName ist der Paketname.
+        if relLen > 0 { cmdProvCheckPkg(home, relName as pchar, ename, seg); }
+      } else {
+        var subName: int64 := alloc(CMD_PATH_MAX);
+        var sp: int64 := 0;
+        if relLen > 0 {
+          sp := cmdWrS(subName, sp, relName as pchar);
+          sp := cmdWrS(subName, sp, "/"c);
+        }
+        memcpy(subName + sp, ename as int64, elen);
+        sp := sp + elen;
+        poke8(subName + sp, 0);
+
+        var subPath: int64 := alloc(CMD_PATH_MAX);
+        var pp: int64 := 0;
+        pp := cmdWrS(subPath, pp, dirPath);
+        pp := cmdWrS(subPath, pp, "/"c);
+        memcpy(subPath + pp, ename as int64, elen);
+        pp := pp + elen;
+        poke8(subPath + pp, 0);
+
+        cmdProvWalk(home, subPath as pchar, subName, sp, seg, depth + 1);
+
+        free(subPath, CMD_PATH_MAX);
+        free(subName, CMD_PATH_MAX);
+      }
+    }
+    i := i + 1;
+  }
+  LpmDirClose(dl);
+}
+
+// Loest arg ueber [build.provides] eines gecachten Pakets auf.
+//
+// arg ist der Importname in Punktschreibweise ("std.cloud.gcp.jwt"). Das erste
+// Segment ist der Schluessel, der Rest wird zum Pfad unter dem angegebenen
+// Verzeichnis.
+//
+// Rueckgabe: CMD_PROV_HIT (ausgegeben), CMD_PROV_NONE (kein Treffer, weiter
+// suchen) oder CMD_PROV_AMBIG (mehrdeutig — gemeldet, und der Aufrufer bricht
+// ab statt weiterzusuchen).
+fn cmdResolveViaProvides(home: pchar, arg: pchar, entry: bool): int64 {
+  // Erstes Segment abschneiden.
+  var al: int64 := StrLen(arg);
+  var cut: int64 := 0 - 1;
+  var i: int64 := 0;
+  while i < al {
+    if peek8(arg as int64 + i) as int64 == 46 {
+      if cut < 0 { cut := i; }
+    }
+    i := i + 1;
+  }
+
+  var seg: int64 := alloc(CMD_NAME_MAX);
+  var rest: int64 := alloc(CMD_PATH_MAX);
+  if cut < 0 {
+    var p: int64 := cmdWrS(seg, 0, arg);
+    poke8(seg + p, 0);
+    poke8(rest, 0);
+  } else {
+    if cut >= CMD_NAME_MAX { free(rest, CMD_PATH_MAX); free(seg, CMD_NAME_MAX); return CMD_PROV_NONE; }
+    memcpy(seg, arg as int64, cut);
+    poke8(seg + cut, 0);
+    // Rest mit '/' statt '.' — aus std.cloud.gcp.jwt wird cloud/gcp/jwt.
+    var rl: int64 := al - cut - 1;
+    var j: int64 := 0;
+    while j < rl {
+      var c: int64 := peek8(arg as int64 + cut + 1 + j) as int64;
+      if c == 46 { c := 47; }
+      poke8(rest + j, c as int8);
+      j := j + 1;
+    }
+    poke8(rest + rl, 0);
+  }
+
+  cmdProvInit();
+  var root: pchar := LpmCacheDir(home);
+  var empty: int64 := alloc(8);
+  poke8(empty, 0);
+  cmdProvWalk(home, root, empty, 0, seg as pchar, 0);
+  free(empty, 8);
+  LpmCacheFreePath(root);
+
+  var res: int64 := CMD_PROV_NONE;
+
+  if cmdProvCount > 1 {
+    // Mehrdeutigkeit ist ein Fehler, nicht der erste Fund. Beide Namen
+    // gehoeren in die Meldung, sonst sucht man im falschen Paket.
+    cmdEOut("lpm: error: Importname \""c); cmdEOut(seg as pchar);
+    cmdEOutLn("\" wird von mehreren gecachten Paketen bedient:"c);
+    var k: int64 := 0;
+    while k < cmdProvCount {
+      cmdEOut("     "c);
+      cmdEOut(peek64(cmdProvNames + k * 8) as pchar);
+      cmdEOut("@"c);
+      cmdEOut(peek64(cmdProvVers + k * 8) as pchar);
+      cmdEOut(" ([build.provides] "c);
+      cmdEOut(seg as pchar);
+      cmdEOut(" = \""c);
+      cmdEOut(peek64(cmdProvDirs + k * 8) as pchar);
+      cmdEOutLn("\")"c);
+      k := k + 1;
+    }
+    cmdEOutLn("     Eines der beiden Pakete aus dem Cache entfernen: lpm cache remove <name>"c);
+    res := CMD_PROV_AMBIG;
+  } else {
+    if cmdProvCount == 1 {
+      var pkgName: pchar := peek64(cmdProvNames) as pchar;
+      var pkgVer:  pchar := peek64(cmdProvVers)  as pchar;
+      var provDir: pchar := peek64(cmdProvDirs)  as pchar;
+
+      var dir: pchar := LpmCachePkgPath(home, pkgName, pkgVer);
+      if !entry {
+        sys_write(1, dir as int64, StrLen(dir));
+        sys_write(1, "\n"c as int64, 1);
+        res := CMD_PROV_HIT;
+      } else {
+        // <cache>/<paket>/<version>/<provDir>/<rest>.lyx, sonst .lyu
+        var file: int64 := alloc(CMD_PATH_MAX);
+        var fp: int64 := 0;
+        fp := cmdWrS(file, fp, dir);
+        fp := cmdWrS(file, fp, "/"c);
+        fp := cmdWrS(file, fp, provDir);
+        if peek8(rest) as int64 != 0 {
+          fp := cmdWrS(file, fp, "/"c);
+          fp := cmdWrS(file, fp, rest as pchar);
+        }
+        var base: int64 := fp;
+        fp := cmdWrS(file, base, ".lyx"c);
+        poke8(file + fp, 0);
+        var found: bool := FileExists(file as pchar);
+        if !found {
+          fp := cmdWrS(file, base, ".lyu"c);
+          poke8(file + fp, 0);
+          found := FileExists(file as pchar);
+        }
+        if found {
+          sys_write(1, file, StrLen(file as pchar));
+          sys_write(1, "\n"c as int64, 1);
+          res := CMD_PROV_HIT;
+        }
+        free(file, CMD_PATH_MAX);
+      }
+      LpmCacheFreePath(dir);
+    }
+  }
+
+  cmdProvFree();
+  free(rest, CMD_PATH_MAX);
+  free(seg, CMD_NAME_MAX);
+  return res;
+}
+
 fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   var arg: pchar := ctx.LcSubArg(0);
   if arg == 0 as pchar {
@@ -1799,7 +2067,27 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
     k := k + 1;
   }
 
-  // 3. Sonst vollstaendig aufloesen, in derselben Reihenfolge.
+  // 3. Noch immer im Cache: [build.provides] eines Pakets, das anders heisst
+  //    als der Import, den es bedient (Issue #6). Das kommt VOR dem
+  //    Registry-Weg, damit ein Treffer aus dem Cache weder Netz noch eine
+  //    Fehlermeldung ueber ein Paket erzeugt, das es nie geben sollte.
+  //    Innerhalb des Caches bleibt die Rangfolge: Paketname, dann
+  //    [build.units], dann [build.provides].
+  if !done {
+    var prov: int64 := cmdResolveViaProvides(home, arg, wantEntry);
+    if prov == CMD_PROV_AMBIG {
+      // Mehrdeutig ist ein Fehler, keine offene Frage: nicht weitersuchen und
+      // auch nicht die Registry fragen, sonst folgt der echten Meldung ein
+      // Schwall ueber Pakete, die es nie geben sollte.
+      free(segBuf, CMD_NAME_MAX);
+      free(parent, CMD_NAME_MAX);
+      free(name, CMD_NAME_MAX);
+      return 1;
+    }
+    if prov == CMD_PROV_HIT { done := true; }
+  }
+
+  // 4. Sonst vollstaendig aufloesen, in derselben Reihenfolge.
   if !done { done := cmdResolveViaRegistry(ctx, home, pkg, 0 as pchar, wantEntry); }
   k := 0;
   while !done {
@@ -1871,6 +2159,16 @@ fn cmdCheckUnits(dir: pchar, mf: Manifest): bool {
     cmdEOutLn(" Eintrag/Eintraege mehr, als lpm fasst."c);
     cmdEOut("     Obergrenze: "c); cmdEOutInt(MF_MAX_UNITS);
     cmdEOutLn(" Eintraege. Gepackt wuerde ein Manifest, das Units verschweigt."c);
+    return false;
+  }
+
+  // Dasselbe fuer [build.provides]: ein verlorener Eintrag heisst, dass ein
+  // Import sein Paket nicht findet (Issue #6).
+  if mf.MfProvLost() > 0 {
+    cmdEOut("lpm: error: [build.provides] hat "c); cmdEOutInt(mf.MfProvLost());
+    cmdEOutLn(" Eintrag/Eintraege mehr, als lpm fasst."c);
+    cmdEOut("     Obergrenze: "c); cmdEOutInt(MF_MAX_PROV);
+    cmdEOutLn(" Eintraege."c);
     return false;
   }
 
