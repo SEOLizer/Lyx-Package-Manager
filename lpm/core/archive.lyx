@@ -8,6 +8,7 @@
 //
 // Sicherheitsgrenzen dieses Layers:
 //   * LPA_TAR_MAX begrenzt die entpackte Groesse (Dekompressionsbombe).
+//   * LPA_MAX_FILES begrenzt die Anzahl Dateien (Inode-Bombe).
 //   * lpaNameSafe verwirft absolute Pfade und jedes ".."-Segment, damit ein
 //     praepariertes Archiv nicht ausserhalb von destDir schreiben kann.
 //   * SHA256 wird gegen den erwarteten Hex-Wert geprueft, bevor entpackt wird.
@@ -31,10 +32,17 @@ pub con LPA_ERR_TAR:   int64 := 0 - 4;   // kein gueltiges tar
 pub con LPA_ERR_PATH:  int64 := 0 - 5;   // unsicherer Eintragsname im Archiv
 pub con LPA_ERR_WRITE: int64 := 0 - 6;   // Zieldatei nicht schreibbar
 pub con LPA_ERR_HASH:  int64 := 0 - 7;   // SHA256 stimmt nicht
+pub con LPA_ERR_COUNT: int64 := 0 - 8;   // mehr Dateien als LPA_MAX_FILES
 
 con LPA_TAR_START: int64 := 262144;      // 256 KiB erster Versuch
 con LPA_TAR_MAX:   int64 := 67108864;    // 64 MiB Obergrenze
 con LPA_PATH_MAX:  int64 := 4096;
+// Dateien je Paket. Dieselbe Grenze zieht `lpm pack` (PK_MAX_FILES); hier
+// steht sie noch einmal, weil ein Archiv nicht von diesem lpm gebaut sein
+// muss. Ohne sie reicht LPA_TAR_MAX nicht: 64 MiB in Ein-Byte-Dateien sind
+// Millionen Eintraege — der Cache fuellt sich mit Inodes statt mit Bytes.
+// Das erzeugte FILES.sha256 zaehlt nicht mit, wie bei pack.
+con LPA_MAX_FILES: int64 := 4096;
 con LPA_DIR_MODE:  int64 := 493;         // 0755
 con LPA_TMP_NAME:  int64 := 0;           // Platzhalter, siehe lpaTmpTarPath
 
@@ -201,6 +209,21 @@ fn lpaTarExtract(tarPath: int64, destDir: pchar): int64 {
   if h == 0 { return LPA_ERR_TAR; }
 
   var count: int64 := TarCount(h);
+
+  // Erst zaehlen, dann schreiben: ein zu grosses Archiv soll kein halb
+  // entpacktes Verzeichnis hinterlassen.
+  var payload: int64 := 0;
+  var c: int64 := 0;
+  while c < count {
+    var cn: int64 := TarName(h, c);
+    if StrCmp(cn as pchar, "FILES.sha256"c) != 0 { payload := payload + 1; }
+    c := c + 1;
+  }
+  if payload > LPA_MAX_FILES {
+    TarClose(h);
+    return LPA_ERR_COUNT;
+  }
+
   var written: int64 := 0;
   var status: int64 := LPA_OK;
   var outPath: int64 := alloc(LPA_PATH_MAX);
@@ -296,6 +319,7 @@ pub fn LpmArchiveErrStr(code: int64): pchar {
   if code == LPA_ERR_PATH  { return "unsicherer Pfad im Archiv"c; }
   if code == LPA_ERR_WRITE { return "Schreiben fehlgeschlagen"c; }
   if code == LPA_ERR_HASH  { return "SHA256 stimmt nicht"c; }
+  if code == LPA_ERR_COUNT { return "zu viele Dateien im Archiv (Limit 4096)"c; }
   return "unbekannter Fehler"c;
 }
 

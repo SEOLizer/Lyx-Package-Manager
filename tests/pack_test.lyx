@@ -11,16 +11,17 @@
 @description("lpm pack tests")
 @author("Andreas Röne")
 @copyright("2026 Andreas Röne")
-@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, system.exit, memory.mmap])
+@capabilities([fs.read, fs.write, fs.create, fs.delete, fs.meta, fs.perm, system.time, system.exit, memory.mmap])
 unit main;
 
 import std.io grant [fs.read, fs.write];
-import std.fs grant [fs.read, fs.write, fs.create, fs.delete, fs.meta];
+import std.fs grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, fs.perm, system.time];
 import lpm.core.pack grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, memory.mmap];
 import lpm.core.archive grant [fs.read, fs.write, fs.create, fs.delete, fs.meta, memory.mmap];
 import lpm.core.manifest grant [fs.read, fs.write];
 
 con TMP: pchar := "tests-tmp"c;
+con PK_T_PATH: int64 := 256;   // Puffer fuer gebaute Testpfade
 con SRC: pchar := "tests-tmp/src"c;
 con OUT: pchar := "tests-tmp/out.lxpkg"c;
 con UNP: pchar := "tests-tmp/unpacked"c;
@@ -500,6 +501,244 @@ fn testBuildUnits(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Dateigrenze: 500 Dateien je Paket
+// ---------------------------------------------------------------------------
+//
+// Gezaehlt werden die eingepackten Dateien; FILES.sha256 erzeugt pack selbst
+// und zaehlt nicht mit. Gebaut wird zweimal: genau an der Grenze muss es
+// gelingen, eine Datei darueber muss PK_ERR_LIMIT geben und kein Archiv
+// hinterlassen. Dieselbe Zahl zieht der Entpacker (LPA_MAX_FILES) — ein
+// Archiv darueber kann dieses pack gar nicht bauen, deshalb steht die
+// Entpackseite hier nur insoweit, wie sie an der Grenze noch traegt.
+
+// Schreibt "<dir>/f<i>.lyx" NUL-terminiert nach dst.
+fn limitPath(dst: int64, dir: pchar, i: int64): void {
+  var dl: int64 := StrLen(dir);
+  memcpy(dst, dir as int64, dl);
+  var pos: int64 := dl;
+  poke8(dst + pos, 47); pos := pos + 1;
+  poke8(dst + pos, 102); pos := pos + 1;   // 'f'
+  var digits: int64 := alloc(24);
+  var d: int64 := i;
+  var dn: int64 := 0;
+  while d > 0 {
+    poke8(digits + dn, (48 + d % 10) as int8);
+    d := d / 10;
+    dn := dn + 1;
+  }
+  var k: int64 := dn;
+  while k > 0 {
+    poke8(dst + pos, peek8(digits + k - 1));
+    pos := pos + 1;
+    k := k - 1;
+  }
+  free(digits, 24);
+  memcpy(dst + pos, ".lyx"c as int64, 4);
+  pos := pos + 4;
+  poke8(dst + pos, 0);
+}
+
+// Raeumt ein Verzeichnis mit durchnummerierten Dateien wieder weg.
+fn limitSource(n: int64): void {
+  Mkdir(TMP, 493);
+  Mkdir("tests-tmp/viele"c, 493);
+  writeFile("tests-tmp/viele/lyx.toml"c,
+            "[package]\nname = \"demo/viele\"\nversion = \"1.0.0\"\n"c);
+  // lyx.toml zaehlt mit, also n-1 weitere Dateien anlegen.
+  var name: int64 := alloc(PK_T_PATH);
+  var i: int64 := 1;
+  while i < n {
+    limitPath(name, "tests-tmp/viele"c, i);
+    writeFile(name as pchar, "unit demo.viele;\n"c);
+    i := i + 1;
+  }
+  free(name, PK_T_PATH);
+}
+
+fn limitDropDir(dir: pchar): void {
+  var name: int64 := alloc(PK_T_PATH);
+  var i: int64 := 1;
+  while i < 525 {
+    limitPath(name, dir, i);
+    DeleteFile(name as pchar);
+    i := i + 1;
+  }
+  var dl: int64 := StrLen(dir);
+  memcpy(name, dir as int64, dl);
+  poke8(name + dl, 47);
+  memcpy(name + dl + 1, "lyx.toml"c as int64, 9);
+  DeleteFile(name as pchar);
+  memcpy(name + dl + 1, "FILES.sha256"c as int64, 13);
+  DeleteFile(name as pchar);
+  free(name, PK_T_PATH);
+  Rmdir(dir);
+}
+
+fn limitCleanup(): void {
+  limitDropDir("tests-tmp/viele"c);
+  limitDropDir("tests-tmp/viele-unp"c);
+  DeleteFile("tests-tmp/viele.lxpkg"c);
+}
+
+fn testFileLimit(): void {
+  outLn("Dateigrenze (Issue #4: std braucht 503)"c);
+
+  // 520 Dateien: mehr als die alten 512, damit der gemessene Stand der
+  // Standardbibliothek samt Luft durchlaeuft.
+  limitSource(520);
+  var sha: int64 := alloc(65);
+  okInt("520 Dateien gehen durch"c,
+        PkBuild("tests-tmp/viele"c, "tests-tmp/viele.lxpkg"c, sha), PK_OK);
+  ok("Archiv liegt da"c, FileExists("tests-tmp/viele.lxpkg"c));
+
+  // Die Entpackseite muss dieselbe Zahl tragen — ein Test, der nur das Packen
+  // prueft, uebersieht LPA_MAX_FILES.
+  var n: int64 := LpmUnpackLxpkg("tests-tmp/viele.lxpkg"c, "tests-tmp/viele-unp"c);
+  okInt("entpackt 521 Eintraege (520 + FILES.sha256)"c, n, 521);
+
+  // Und FILES.sha256 muss jede Datei nennen, nicht nur die ersten.
+  ok("letzte Datei ist entpackt"c, FileExists("tests-tmp/viele-unp/f519.lyx"c));
+  okInt("Integritaet des grossen Pakets"c,
+        LpmVerifyPackage("tests-tmp/viele-unp"c), LPA_VERIFY_OK);
+
+  free(sha, 65);
+  limitCleanup();
+}
+
+// ---------------------------------------------------------------------------
+// Verzeichnistiefe
+// ---------------------------------------------------------------------------
+//
+// std/cloud/gcp/credentials.lyx lag genau auf der alten Grenze 4. Geprueft
+// wird Tiefe 5: packen, entpacken, und die tiefste Datei muss ankommen. Vorher
+// wurde sie stillschweigend uebersprungen — deshalb zaehlt hier nicht nur der
+// Rueckgabewert, sondern die Datei selbst.
+
+fn testDepth(): void {
+  outLn("Verzeichnistiefe (Issue #4: Tiefe 5)"c);
+
+  Mkdir(TMP, 493);
+  Mkdir("tests-tmp/tief"c, 493);
+  Mkdir("tests-tmp/tief/a"c, 493);
+  Mkdir("tests-tmp/tief/a/b"c, 493);
+  Mkdir("tests-tmp/tief/a/b/c"c, 493);
+  Mkdir("tests-tmp/tief/a/b/c/d"c, 493);
+  Mkdir("tests-tmp/tief/a/b/c/d/e"c, 493);
+
+  writeFile("tests-tmp/tief/lyx.toml"c,
+            "[package]\nname = \"demo/tief\"\nversion = \"1.0.0\"\n"c);
+  writeFile("tests-tmp/tief/a/b/c/d/e/tief.lyx"c, "unit demo.tief;\n"c);
+
+  var sha: int64 := alloc(65);
+  okInt("Tiefe 5 packt"c,
+        PkBuild("tests-tmp/tief"c, "tests-tmp/tief.lxpkg"c, sha), PK_OK);
+  var n: int64 := LpmUnpackLxpkg("tests-tmp/tief.lxpkg"c, "tests-tmp/tief-unp"c);
+  okInt("drei Eintraege entpackt"c, n, 3);
+  ok("die tiefste Datei ist da"c,
+     FileExists("tests-tmp/tief-unp/a/b/c/d/e/tief.lyx"c));
+  free(sha, 65);
+
+  DeleteFile("tests-tmp/tief/lyx.toml"c);
+  DeleteFile("tests-tmp/tief/a/b/c/d/e/tief.lyx"c);
+  Rmdir("tests-tmp/tief/a/b/c/d/e"c); Rmdir("tests-tmp/tief/a/b/c/d"c);
+  Rmdir("tests-tmp/tief/a/b/c"c); Rmdir("tests-tmp/tief/a/b"c);
+  Rmdir("tests-tmp/tief/a"c); Rmdir("tests-tmp/tief"c);
+  DeleteFile("tests-tmp/tief-unp/lyx.toml"c);
+  DeleteFile("tests-tmp/tief-unp/FILES.sha256"c);
+  DeleteFile("tests-tmp/tief-unp/a/b/c/d/e/tief.lyx"c);
+  Rmdir("tests-tmp/tief-unp/a/b/c/d/e"c); Rmdir("tests-tmp/tief-unp/a/b/c/d"c);
+  Rmdir("tests-tmp/tief-unp/a/b/c"c); Rmdir("tests-tmp/tief-unp/a/b"c);
+  Rmdir("tests-tmp/tief-unp/a"c); Rmdir("tests-tmp/tief-unp"c);
+  DeleteFile("tests-tmp/tief.lxpkg"c);
+}
+
+// ---------------------------------------------------------------------------
+// [build.units]: Menge und Ueberlauf (Issue #3)
+// ---------------------------------------------------------------------------
+
+// Ein mehrstufiger Unit-Schluessel (Issue #2): in der lyx.toml gequotet, weil
+// TOML den Punkt sonst als Tabellentrenner liest. Die Tabelle muss ihn genau
+// so wieder herausgeben — `lpm resolve vega.backend.x11` schlaegt ihn als
+// "backend.x11" nach.
+fn testDottedUnitKey(): void {
+  outLn("[build.units] mit Punkt im Schluessel (Issue #2)"c);
+
+  Mkdir(TMP, 493);
+  writeFile("tests-tmp/punkt.toml"c,
+            "[package]\nname = \"vega\"\nversion = \"0.2.0\"\n\n[build]\nentry = \"vega.lyx\"\n\n[build.units]\nforms = \"vega/forms.lyx\"\n\"backend.x11\" = \"vega/backend/x11.lyx\"\n"c);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+  ok("gelesen"c, mf.MfRead("tests-tmp/punkt.toml"c));
+  okInt("zwei Units"c, mf.MfUnitCount(), 2);
+  okStr("einstufig"c, mf.MfFindUnit("forms"c), "vega/forms.lyx"c);
+  okStr("zweistufig"c, mf.MfFindUnit("backend.x11"c), "vega/backend/x11.lyx"c);
+  ok("nicht als Pfad verbogen"c, mf.MfFindUnit("backend/x11"c) == 0 as pchar);
+
+  // Schreiben und wieder lesen: das Quoting muss erhalten bleiben.
+  ok("geschrieben"c, mf.MfWrite("tests-tmp/punkt2.toml"c));
+  var mf2: Manifest := new Manifest();
+  mf2.MfInit();
+  ok("wieder gelesen"c, mf2.MfRead("tests-tmp/punkt2.toml"c));
+  okStr("zweistufig ueberlebt"c, mf2.MfFindUnit("backend.x11"c),
+        "vega/backend/x11.lyx"c);
+
+  mf2.MfFree(); dispose mf2;
+  mf.MfFree(); dispose mf;
+  DeleteFile("tests-tmp/punkt.toml"c);
+  DeleteFile("tests-tmp/punkt2.toml"c);
+}
+
+fn testUnitLimit(): void {
+  outLn("[build.units] (Issue #3)"c);
+
+  var mf: Manifest := new Manifest();
+  mf.MfInit();
+
+  // 500 Units, so viele hat die Standardbibliothek. Mit der alten Grenze 32
+  // waeren 468 davon stillschweigend verschwunden.
+  var name: int64 := alloc(PK_T_PATH);
+  var file: int64 := alloc(PK_T_PATH);
+  var i: int64 := 0;
+  var added: int64 := 0;
+  while i < 500 {
+    limitPath(name, "u"c, i);        // "u/f<i>.lyx" — als Name gut genug
+    limitPath(file, "src"c, i);
+    if mf.MfAddUnit(name as pchar, file as pchar) { added := added + 1; }
+    i := i + 1;
+  }
+  okInt("500 Units aufgenommen"c, added, 500);
+  okInt("MfUnitCount stimmt"c, mf.MfUnitCount(), 500);
+  okInt("nichts verloren"c, mf.MfUnitsLost(), 0);
+
+  // Ueberlauf: bis MF_MAX_UNITS auffuellen, dann drei Eintraege darueber.
+  while i < MF_MAX_UNITS {
+    limitPath(name, "u"c, i);
+    limitPath(file, "src"c, i);
+    mf.MfAddUnit(name as pchar, file as pchar);
+    i := i + 1;
+  }
+  okInt("voll bei MF_MAX_UNITS"c, mf.MfUnitCount(), MF_MAX_UNITS);
+
+  var over: int64 := 0;
+  var k: int64 := 0;
+  while k < 3 {
+    limitPath(name, "u"c, MF_MAX_UNITS + k);
+    limitPath(file, "src"c, MF_MAX_UNITS + k);
+    if !mf.MfAddUnit(name as pchar, file as pchar) { over := over + 1; }
+    k := k + 1;
+  }
+  okInt("Ueberlauf wird gemeldet"c, over, 3);
+  okInt("und gezaehlt"c, mf.MfUnitsLost(), 3);
+  okInt("keiner heimlich dazugekommen"c, mf.MfUnitCount(), MF_MAX_UNITS);
+  ok("PK_ERR_UNITS hat einen Text"c, PkErrStr(PK_ERR_UNITS) != 0 as pchar);
+
+  free(file, PK_T_PATH);
+  free(name, PK_T_PATH);
+  mf.MfFree(); dispose mf;
+}
+
+// ---------------------------------------------------------------------------
 
 pub fn main(argc: int64, argv: pchar): int64 {
   outLn("pack tests"c);
@@ -521,6 +760,10 @@ pub fn main(argc: int64, argv: pchar): int64 {
   testNoUndeclared();
   testDepsJson();
   testBuildUnits();
+  testFileLimit();
+  testDepth();
+  testUnitLimit();
+  testDottedUnitKey();
 
   cleanup();
   ok("tests-tmp/ wieder aufgeraeumt"c, !IsDirectory(TMP));

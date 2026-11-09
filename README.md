@@ -6,7 +6,7 @@ Paket-Cache vor und dient `lyxc` als Auflösungs-Hook für unbekannte Imports.
 
 `lpm` ist selbst vollständig in Lyx geschrieben und wird mit `lyxc` übersetzt.
 
-> **Status: frühe Entwicklung (v0.1.2).** Der Install-Flow läuft end-to-end gegen
+> **Status: frühe Entwicklung (v0.1.3).** Der Install-Flow läuft end-to-end gegen
 > die öffentliche Registry: leerer Cache → Index per HTTPS → Auflösung → Archiv
 > per HTTPS → SHA256-Prüfung → entpackt im Cache. Funktionsfähig sind `init`,
 > `cache list`, `cache clean`, `cache add`, `install`, `remove`, `list`,
@@ -193,6 +193,9 @@ Paketverzeichnis. Ein eigenständiges Paket gleichen Namens hat beim Auflösen
 Vorrang.
 Paketnamen sind hierarchisch (`net/http`) und passen damit direkt zur
 Lyx-Import-Syntax. Erlaubte Zeichen: `[a-z0-9_/.-]`.
+Ein Paket fasst 4096 Dateien, 4096 Einträge in `[build.units]`, 8
+Verzeichnisebenen und 64 MiB entpackt; jede Überschreitung bricht `lpm pack`
+ab, statt stillschweigend Einträge zu verlieren (Issues #3, #4).
 
 ### Lock-Datei (`lyx.lock`)
 
@@ -376,7 +379,10 @@ gespiegelten Indizes; fehlt ein Paket, wird sein Index nachgeladen und erneut
 aufgelöst — transitive Abhängigkeiten tauchen erst auf, wenn der Index ihres
 Elternpakets gelesen ist. Was aufgelöst ist und nicht im Cache liegt, wird
 heruntergeladen, gegen den `sha256` aus `lyx.lock` geprüft und erst dann
-entpackt. Ein zweites `lpm install` ohne Änderung rechnet nicht neu.
+entpackt. Ein zweites `lpm install` ohne Änderung rechnet nicht neu — es prüft
+aber, ob jedes gelockte Paket wirklich im Cache liegt. Fehlt eines, wird der
+gelockte Stand als exakte Version festgehalten, neu aufgelöst und nur das
+Fehlende geholt (Issue #2442); die Versionen bewegen sich dabei nicht.
 
 Von PM-07 ist die lpm-Seite fertig: `lpm resolve <pkg>` löst auf, lädt bei
 Bedarf und schreibt **genau eine Zeile** auf stdout — ohne `--entry` das

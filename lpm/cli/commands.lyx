@@ -114,7 +114,7 @@ fn cmdGetHome(argc: int64, argv: pchar): pchar {
 // ---------------------------------------------------------------------------
 
 fn lpmHelp(): void {
-  cmdOutLn("lpm 0.1.2 — Lyx Package Manager"c);
+  cmdOutLn("lpm 0.1.3 — Lyx Package Manager"c);
   cmdOutLn(""c);
   cmdOutLn("Verwendung: lpm <subcommand> [optionen]"c);
   cmdOutLn(""c);
@@ -152,7 +152,7 @@ fn lpmHelp(): void {
 // ---------------------------------------------------------------------------
 
 fn lpmVersion(): void {
-  cmdOutLn("lpm 0.1.2"c);
+  cmdOutLn("lpm 0.1.3"c);
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +580,39 @@ fn cmdLockSatisfies(mf: Manifest, lock: LockFile): bool {
   return true;
 }
 
+// Zaehlt die gelockten Pakete, die nicht im Cache liegen, und nennt sie.
+// `lpm list` prueft genau das schon — `lpm install` darf sich deshalb nicht
+// allein darauf verlassen, dass lyx.lock zu lyx.toml passt (Issue #2442).
+fn cmdLockCacheMissing(home: pchar, lock: LockFile, report: bool): int64 {
+  if home == 0 as pchar { return 0; }
+  var missing: int64 := 0;
+  var i: int64 := 0;
+  while i < lock.LfCount() {
+    var nm: pchar := lock.LfGetName(i);
+    var vr: pchar := lock.LfGetVer(i);
+    if !LpmCacheHas(home, nm, vr) {
+      missing := missing + 1;
+      if report {
+        cmdOut("lpm: "c); cmdOut(nm); cmdOut("@"c); cmdOut(vr);
+        cmdOutLn(" ist gelockt, liegt aber nicht im Cache."c);
+      }
+    }
+    i := i + 1;
+  }
+  return missing;
+}
+
+// Haelt jeden Lock-Eintrag als exakte Version im Manifest fest. Damit loest
+// die anschliessende Aufloesung genau den gelockten Stand auf — sie holt nur
+// nach, was fehlt, und bewegt keine Version.
+fn cmdPinToLock(mf: Manifest, lock: LockFile): void {
+  var i: int64 := 0;
+  while i < lock.LfCount() {
+    mf.MfSetDep(lock.LfGetName(i), lock.LfGetVer(i));
+    i := i + 1;
+  }
+}
+
 // Loest auf und schreibt lyx.lock.
 // Rueckgabe: CMD_RES_OK, CMD_RES_FAIL (Aufloesung gescheitert) oder
 // CMD_RES_INCOMPLETE (aufgeloest, aber nicht alles liegt lokal vor).
@@ -790,10 +823,17 @@ fn lpmInstall(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
       lock.LfInit();
       if lock.LfRead("lyx.lock"c) {
         if cmdLockSatisfies(mf, lock) {
-          cmdOutLn("lpm: lyx.lock ist aktuell — nichts zu tun."c);
-          lock.LfFree(); dispose lock;
-          mf.MfFree(); dispose mf;
-          return 0;
+          // Passt lyx.lock zu lyx.toml, heisst das noch nicht, dass die
+          // gelockten Pakete auch lokal liegen. Fehlt eines, wird genau der
+          // gelockte Stand aufgeloest und das Fehlende geholt (Issue #2442).
+          var miss: int64 := cmdLockCacheMissing(home, lock, true);
+          if miss == 0 {
+            cmdOutLn("lpm: lyx.lock ist aktuell — nichts zu tun."c);
+            lock.LfFree(); dispose lock;
+            mf.MfFree(); dispose mf;
+            return 0;
+          }
+          cmdPinToLock(mf, lock);
         }
       }
       lock.LfFree(); dispose lock;
@@ -1347,6 +1387,24 @@ fn cmdEOutLn(s: pchar): void {
   sys_write(2, "\n"c as int64, 1);
 }
 
+fn cmdEOutInt(n: int64): void {
+  if n == 0 { sys_write(2, "0"c as int64, 1); return; }
+  var v: int64 := n;
+  if v < 0 {
+    sys_write(2, "-"c as int64, 1);
+    v := 0 - v;
+  }
+  var buf: int64 := alloc(24);
+  var i: int64 := 24;
+  while v > 0 {
+    i := i - 1;
+    poke8(buf + i, (48 + v % 10) as int8);
+    v := v / 10;
+  }
+  sys_write(2, buf + i, 24 - i);
+  free(buf, 24);
+}
+
 // Übersetzt einen Import-Namen in einen Paketnamen.
 //
 // lyxc sieht `import net.http` und kennt damit Punkte als Trenner; die Registry
@@ -1510,6 +1568,48 @@ fn cmdEntryPath(dir: pchar, name: pchar, out: int64, cap: int64): bool {
 // Zerlegt "Vega/Types" in Elternpaket "Vega" und Segment "Types".
 // Rueckgabe: Zeiger auf das letzte Segment innerhalb von name, oder 0, wenn
 // der Name nur aus einem Segment besteht (dann gibt es kein Elternpaket).
+// Wie cmdSplitParent, aber fuer die k-te Trennstelle von rechts (k = 0 ist die
+// letzte). Das Elternpaket kommt mit Slashes nach out, das Unit-Segment mit
+// PUNKTEN nach segOut — so, wie der Schluessel in [build.units] geschrieben
+// steht: `"backend.x11" = "vega/backend/x11.lyx"`.
+//
+// Ohne diese Stufen fand `lpm resolve vega.backend.x11` nur die Zerlegung
+// vega/backend + x11 und meldete "Paket nicht in der Registry — vega/backend",
+// obwohl die Unit als backend.x11 im Paket vega steht (Issue #2).
+// Rueckgabe: false, wenn es keine k-te Trennstelle gibt.
+fn cmdSplitParentNth(name: pchar, k: int64, out: int64, segOut: int64,
+                     cap: int64): bool {
+  var n: int64 := StrLen(name);
+  var seen: int64 := 0;
+  var cut: int64 := 0 - 1;
+  var i: int64 := n - 1;
+  while i > 0 {
+    if peek8(name as int64 + i) as int64 == 47 {
+      if seen == k { cut := i; i := 0; } else { seen := seen + 1; }
+    }
+    if i > 0 { i := i - 1; }
+  }
+  if cut <= 0 { return false; }
+  if cut + 1 >= n { return false; }
+  if cut + 1 >= cap { return false; }
+
+  memcpy(out, name as int64, cut);
+  poke8(out + cut, 0);
+
+  // Rest kopieren und Slashes zu Punkten zurueckdrehen.
+  var rl: int64 := n - cut - 1;
+  if rl + 1 >= cap { return false; }
+  var j: int64 := 0;
+  while j < rl {
+    var c: int64 := peek8(name as int64 + cut + 1 + j) as int64;
+    if c == 47 { c := 46; }
+    poke8(segOut + j, c as int8);
+    j := j + 1;
+  }
+  poke8(segOut + rl, 0);
+  return true;
+}
+
 fn cmdSplitParent(name: pchar, out: int64, cap: int64): pchar {
   var n: int64 := StrLen(name);
   var cut: int64 := 0 - 1;
@@ -1681,41 +1781,52 @@ fn lpmResolve(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   // "Vega/Types" also als Unit Types im Paket Vega. Das Elternpaket wird nur
   // ersatzweise befragt: ein eigenstaendiges Paket hat immer Vorrang.
   var parent: int64 := alloc(CMD_NAME_MAX);
-  var seg: pchar := cmdSplitParent(pkg, parent, CMD_NAME_MAX);
-  var par: pchar := parent as pchar;
+  var segBuf: int64 := alloc(CMD_NAME_MAX);
 
-  // 1. Beides zuerst aus Lock und Cache — ohne Netz und ohne Uhr. Das ist der
-  //    haeufigste Fall waehrend einer Kompilierung.
+  // 1. Zuerst das Paket selbst aus Lock und Cache — ohne Netz und ohne Uhr.
+  //    Das ist der haeufigste Fall waehrend einer Kompilierung.
   var done: bool := cmdResolveFromCache(ctx, home, pkg, 0 as pchar, wantEntry);
-  if !done {
-    if seg != 0 as pchar {
-      done := cmdResolveFromCache(ctx, home, par, seg, wantEntry);
-    }
+
+  // 2. Dann die Zerlegungen in Elternpaket + Unit, von der feinsten zur
+  //    grobsten: vega/backend + x11, dann vega + backend.x11. Ein
+  //    eigenstaendiges Paket hat damit weiter Vorrang, und ein mehrstufiger
+  //    Unit-Name kommt ueberhaupt erst zum Zug (Issue #2).
+  var k: int64 := 0;
+  while !done {
+    if !cmdSplitParentNth(pkg, k, parent, segBuf, CMD_NAME_MAX) { break; }
+    done := cmdResolveFromCache(ctx, home, parent as pchar, segBuf as pchar,
+                                wantEntry);
+    k := k + 1;
   }
 
-  // 2. Sonst vollstaendig aufloesen, wieder Paket vor Zusatz-Unit.
+  // 3. Sonst vollstaendig aufloesen, in derselben Reihenfolge.
   if !done { done := cmdResolveViaRegistry(ctx, home, pkg, 0 as pchar, wantEntry); }
-  if !done {
-    if seg != 0 as pchar {
-      done := cmdResolveViaRegistry(ctx, home, par, seg, wantEntry);
-    }
+  k := 0;
+  while !done {
+    if !cmdSplitParentNth(pkg, k, parent, segBuf, CMD_NAME_MAX) { break; }
+    done := cmdResolveViaRegistry(ctx, home, parent as pchar, segBuf as pchar,
+                                  wantEntry);
+    k := k + 1;
   }
 
   if !done {
     cmdEOut("lpm: error: "c); cmdEOut(pkg);
-    if seg != 0 as pchar {
-      cmdEOut(" liess sich nicht aufloesen: kein solches Paket, und "c);
-      cmdEOut(par);
-      cmdEOut(" fuehrt \""c); cmdEOut(seg);
-      cmdEOutLn("\" nicht unter [build.units]."c);
+    if cmdSplitParentNth(pkg, 0, parent, segBuf, CMD_NAME_MAX) {
+      cmdEOutLn(" liess sich nicht aufloesen: kein solches Paket, und keine"c);
+      cmdEOutLn("     Zerlegung in Elternpaket + Unit steht unter [build.units]."c);
+      cmdEOut("     Versucht wurde "c); cmdEOut(parent as pchar);
+      cmdEOut(" mit \""c); cmdEOut(segBuf as pchar);
+      cmdEOutLn("\" und jede groebere Zerlegung."c);
     } else {
       cmdEOutLn(" liess sich nicht aufloesen."c);
     }
+    free(segBuf, CMD_NAME_MAX);
     free(parent, CMD_NAME_MAX);
     free(name, CMD_NAME_MAX);
     return 1;
   }
 
+  free(segBuf, CMD_NAME_MAX);
   free(parent, CMD_NAME_MAX);
   free(name, CMD_NAME_MAX);
   return 0;
@@ -1753,6 +1864,16 @@ fn cmdWarnImports(dir: pchar, mf: Manifest): void {
 // Fremdcode `import Vega.Types` schreibt. Faellt sie beim Anwender auf die
 // Nase, ist das Paket schon veroeffentlicht.
 fn cmdCheckUnits(dir: pchar, mf: Manifest): bool {
+  // Erst der Ueberlauf: hat das Manifest Eintraege verworfen, ist jede weitere
+  // Pruefung daneben — das Paket darf so gar nicht entstehen (Issue #3).
+  if mf.MfUnitsLost() > 0 {
+    cmdEOut("lpm: error: [build.units] hat "c); cmdEOutInt(mf.MfUnitsLost());
+    cmdEOutLn(" Eintrag/Eintraege mehr, als lpm fasst."c);
+    cmdEOut("     Obergrenze: "c); cmdEOutInt(MF_MAX_UNITS);
+    cmdEOutLn(" Eintraege. Gepackt wuerde ein Manifest, das Units verschweigt."c);
+    return false;
+  }
+
   var path: int64 := alloc(CMD_PATH_MAX);
   var ok: bool := true;
   var i: int64 := 0;
@@ -1768,6 +1889,23 @@ fn cmdCheckUnits(dir: pchar, mf: Manifest): bool {
       cmdEOut(" verweist auf "c); cmdEOut(f);
       cmdEOutLn(" — diese Datei gibt es nicht."c);
       ok := false;
+    }
+
+    // Ein Schluessel mit Slash kommt beim Verbraucher nie an: dort steht ein
+    // Importname wie `vega.backend.x11`, dessen Segmente mit Punkten getrennt
+    // sind. Lieber beim Packen auffallen als beim Anwender (Issue #2).
+    var un: pchar := mf.MfUnitName(i);
+    var ul: int64 := StrLen(un);
+    var j: int64 := 0;
+    while j < ul {
+      if peek8(un as int64 + j) as int64 == 47 {
+        cmdEOut("lpm: error: [build.units] "c); cmdEOut(un);
+        cmdEOutLn(" — ein Schluessel wird mit Punkten geschrieben, nicht mit Slash."c);
+        cmdEOutLn("     Richtig: \"backend.x11\" = \"vega/backend/x11.lyx\""c);
+        ok := false;
+        j := ul;
+      }
+      j := j + 1;
     }
     i := i + 1;
   }
@@ -1960,6 +2098,12 @@ fn lpmPublish(ctx: LpmCtx, argc: int64, argv: pchar): int64 {
   var pver:  pchar := mf.MfVersion();
   if pname == 0 as pchar || pver == 0 as pchar {
     cmdErr(PkErrStr(PK_ERR_MANIFEST));
+    mf.MfFree(); dispose mf;
+    free(token, CR_TOKEN_MAX);
+    return 1;
+  }
+
+  if !cmdCheckUnits(dir, mf) {
     mf.MfFree(); dispose mf;
     free(token, CR_TOKEN_MAX);
     return 1;

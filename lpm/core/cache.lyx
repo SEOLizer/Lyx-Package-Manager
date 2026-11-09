@@ -24,6 +24,7 @@ import lpm.core.dirent;
 
 con LPC_PATH_MAX: int64 := 4096;
 con LPC_DIR_MODE: int64 := 493;   // 0755
+con LPC_DEPTH_MAX: int64 := 8;
 
 // ---------------------------------------------------------------------------
 // Pfad-Helfer
@@ -162,7 +163,10 @@ fn lpcPrintEntry(prefix: pchar, prefixLen: int64, version: pchar): void {
 // Paket@Version aus. relName ist der bisher aufgebaute Paketname.
 // Rueckgabe: Anzahl gefundener Paket-Versionen.
 fn lpcWalk(dirPath: pchar, relName: int64, relLen: int64, depth: int64): int64 {
-  if depth > 3 { return 0; }
+  // Namensebenen im Cache (net/http/1.2.0 ist Tiefe 2 plus Versionsebene).
+  // Muss mindestens so tief reichen wie Paketnamen werden duerfen, sonst
+  // listet `lpm cache list` ein vorhandenes Paket nicht (Issue #4).
+  if depth > LPC_DEPTH_MAX { return 0; }
 
   var dl: int64 := LpmDirOpen(dirPath);
   if dl == 0 { return 0; }

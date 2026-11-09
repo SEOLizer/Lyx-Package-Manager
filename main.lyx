@@ -1,5 +1,5 @@
 // main.lyx — lpm Einstiegspunkt
-// Lyx Package Manager v0.1.2
+// Lyx Package Manager v0.1.3
 
 @description("lpm — Lyx Package Manager entry point")
 @author("Andreas Röne")

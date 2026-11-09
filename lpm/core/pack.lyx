@@ -40,12 +40,20 @@ pub con PK_ERR_READ:    int64 := 0 - 5;   // Datei liess sich nicht lesen
 pub con PK_ERR_TAR:     int64 := 0 - 6;   // tar-Aufbau fehlgeschlagen
 pub con PK_ERR_ZSTD:    int64 := 0 - 7;   // Kompression fehlgeschlagen
 pub con PK_ERR_WRITE:   int64 := 0 - 8;   // Archiv liess sich nicht schreiben
+pub con PK_ERR_UNITS:   int64 := 0 - 9;   // [build.units] laeuft ueber MF_MAX_UNITS
 
 con PK_PATH_MAX:  int64 := 4096;
-con PK_MAX_FILES: int64 := 512;
+// Dateien je Paket, ohne das erzeugte FILES.sha256. 512 reichten fuer die
+// Standardbibliothek nicht (std: 503 Dateien, neun Luft — Issue #4). Das
+// engere Mass ist ohnehin PK_TOTAL_MAX: 4096 Quelldateien sind bei 64 MiB
+// im Schnitt 16 KiB je Datei, und jede einzelne bleibt unter PK_FILE_MAX.
+con PK_MAX_FILES: int64 := 4096;
 con PK_FILE_MAX:  int64 := 16777216;   // 16 MiB je Datei
 con PK_TOTAL_MAX: int64 := 67108864;   // 64 MiB entpackt, wie die Entpackgrenze
-con PK_DEPTH_MAX: int64 := 4;
+// Verzeichnistiefe im Paket. std/cloud/gcp/credentials.lyx lag genau auf 4;
+// eine Bibliothek darf tiefer schachteln duerfen (Issue #4). Muss zur
+// Entpackseite passen: LPA_MAX_DEPTH in lpm/core/archive.lyx.
+con PK_DEPTH_MAX: int64 := 8;
 
 // ---------------------------------------------------------------------------
 // Kleine Helfer
@@ -139,7 +147,9 @@ fn pkListAdd(rel: int64): bool {
 // relBase ist der bisher aufgebaute relative Pfad ("" auf oberster Ebene).
 // Rueckgabe: false, wenn eine Grenze erreicht wurde.
 fn pkWalk(dir: int64, relBase: int64, depth: int64): bool {
-  if depth > PK_DEPTH_MAX { return true; }
+  // Zu tief: nicht stillschweigend ueberspringen. Ein Paket, das Dateien
+  // verschweigt, ist schlimmer als eines, das nicht baut (Issue #3/#4).
+  if depth > PK_DEPTH_MAX { return false; }
 
   var dl: int64 := LpmDirOpen(dir as pchar);
   if dl == 0 { return true; }
@@ -430,11 +440,12 @@ pub fn PkErrStr(code: int64): pchar {
   if code == PK_ERR_NOTOML   { return "kein lyx.toml in diesem Verzeichnis"c; }
   if code == PK_ERR_MANIFEST { return "lyx.toml ist unvollstaendig (name und version noetig)"c; }
   if code == PK_ERR_EMPTY    { return "keine Datei zum Einpacken gefunden"c; }
-  if code == PK_ERR_LIMIT    { return "zu viele oder zu grosse Dateien"c; }
+  if code == PK_ERR_LIMIT    { return "Grenze erreicht (max. 4096 Dateien, 16 MiB je Datei, 64 MiB gesamt, 8 Verzeichnisebenen)"c; }
   if code == PK_ERR_READ     { return "eine Datei liess sich nicht lesen"c; }
   if code == PK_ERR_TAR      { return "tar-Aufbau fehlgeschlagen"c; }
   if code == PK_ERR_ZSTD     { return "Kompression fehlgeschlagen"c; }
   if code == PK_ERR_WRITE    { return "Archiv liess sich nicht schreiben"c; }
+  if code == PK_ERR_UNITS    { return "[build.units] hat mehr Eintraege als lpm fasst"c; }
   return "unbekannter Fehler"c;
 }
 

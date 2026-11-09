@@ -1,7 +1,7 @@
 # lpm — Handbuch
 
 Vom leeren Verzeichnis bis zum veröffentlichten Paket. Alle Beispiele sind
-gegen `lpm 0.1.2` und `https://lpm.seolizer.de` ausgeführt.
+gegen `lpm 0.1.3` und `https://lpm.seolizer.de` ausgeführt.
 
 Die Serverseite (Registry einrichten, vhost, Token-Datei) steht in
 [`../deploy/README.md`](../deploy/README.md).
@@ -40,7 +40,7 @@ Prüfen:
 
 ```console
 $ lpm --version
-lpm 0.1.2
+lpm 0.1.3
 ```
 
 Systemweit ginge `sudo make install` (nach `/usr/local/bin`), entfernen mit
@@ -300,6 +300,40 @@ Was dabei zu wissen ist:
   Registry-Index. Sie wird beim Auflösen aus dem entpackten Paket gelesen —
   an der Registry ändert sich nichts.
 
+Ein Schlüssel darf selbst mehrstufig sein — dann wird er in der `lyx.toml`
+gequotet, weil TOML den Punkt sonst als Tabellentrenner liest:
+
+```toml
+[build.units]
+forms         = "vega/forms.lyx"
+"backend.x11" = "vega/backend/x11.lyx"
+```
+
+`lpm resolve vega.backend.x11 --entry` probiert von der feinsten zur grobsten
+Zerlegung: erst das Paket `vega/backend/x11`, dann `vega/backend` mit der Unit
+`x11`, dann `vega` mit der Unit `backend.x11`. Ein eigenständiges Paket hat
+also weiter Vorrang (Issue #2). Ein Schlüssel mit Slash wird beim Packen
+abgelehnt: beim Verbraucher steht ein Importname mit Punkten.
+
+### Grenzen eines Pakets
+
+Gemessen an der Lyx-Standardbibliothek (`std`: 500 Units, 503 Dateien) gelten:
+
+| Grenze | Wert | Ort |
+|---|---|---|
+| Dateien je Paket | 4096 | `PK_MAX_FILES`, `LPA_MAX_FILES` |
+| Größe je Datei | 16 MiB | `PK_FILE_MAX` |
+| entpackte Gesamtgröße | 64 MiB | `PK_TOTAL_MAX`, `LPA_TAR_MAX` |
+| Verzeichnisebenen | 8 | `PK_DEPTH_MAX` |
+| Einträge in `[build.units]` | 4096 | `MF_MAX_UNITS` |
+
+Jede Grenze ist laut: `lpm pack` bricht mit `PK_ERR_LIMIT` ab, ein zu tiefes
+Verzeichnis ebenfalls, und ein `[build.units]` über der Grenze mit der Meldung,
+wie viele Einträge nicht aufgenommen wurden. Ein Paket, dessen Manifest
+Einträge verschweigt, entsteht nicht mehr (Issues #3, #4). Die Entpackseite
+zieht dieselben Zahlen, damit ein fremdes Archiv nicht mehr mitbringen kann,
+als dieses lpm packen würde.
+
 Nicht eingetragene Mit-Units bleiben, was sie waren: nur innerhalb ihres
 Pakets brauchbar. Wer `json.lyx` als Innerei von `demo/http` behalten will,
 lässt es einfach aus `[build.units]` heraus.
@@ -551,6 +585,20 @@ Alle übrigen Einträge aus `lyx.lock` werden dabei auf ihrer Version
 festgehalten.
 
 ### Der Cache wird geprüft
+
+Fehlt ein in `lyx.lock` gepinntes Paket im Cache, meldet `lpm install` das und
+holt es nach — auch dann, wenn `lyx.lock` zu `lyx.toml` passt:
+
+```console
+$ lpm install
+lpm: vega@0.1.6 ist gelockt, liegt aber nicht im Cache.
+lpm: hole vega@0.1.6 von https://lpm.seolizer.de
+lpm: 1 Paket(e) aufgeloest, lyx.lock geschrieben.
+```
+
+Aufgelöst wird dabei auf die gelockten Versionen, nicht neu gewählt: jeder
+Lock-Eintrag gilt als exakte Version. Mit `--offline` bleibt es bei der Meldung
+`fehlt im Cache` und Rückgabewert 1.
 
 Ein Paket aus `~/.lpm/cache` wird vor dem Benutzen gegen sein `FILES.sha256`
 geprüft. Weicht eine Datei ab, wird das Paket verworfen und neu geholt:
